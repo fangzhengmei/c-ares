@@ -2665,6 +2665,140 @@ TEST_P(MockUDPSingleTryTest, NewQueryInCancelCallbackConnErrorNoDoubleFree) {
   EXPECT_TRUE(g_replacement_result.done_);
 }
 
+/* A cancellation callback that starts a replacement lookup.  The replacement
+ * must survive the ares_cancel() that spawned it: ares_cancel() moves the
+ * queries present on entry to a cancellation list and only drains that, so
+ * anything enqueued from a callback is a live, ordinary query. */
+struct CancelRespawnData {
+  ares_channel_t *channel;
+  size_t          cancelled_cbs;
+  ares_status_t   cancelled_status;
+  QueryResult    *replacement;
+  bool            spawned;
+};
+
+static void CancelRespawnCallback(void *arg, ares_status_t status,
+                                  size_t                   timeouts,
+                                  const ares_dns_record_t *dnsrec)
+{
+  CancelRespawnData *data = static_cast<CancelRespawnData *>(arg);
+  (void)timeouts;
+  (void)dnsrec;
+  data->cancelled_cbs++;
+  data->cancelled_status = status;
+
+  /* Only the first cancellation callback starts a replacement lookup. */
+  if (data->spawned) {
+    return;
+  }
+  data->spawned = true;
+  ares_query_dnsrec(data->channel, "www.replacement.com", ARES_CLASS_IN,
+                    ARES_REC_TYPE_A, QueryCallback, data->replacement, NULL);
+}
+
+TEST_P(MockUDPChannelTest, NewQueryInCancelCallbackSurvivesAndCancelsCleanly)
+{
+  QueryResult       replacement;
+  CancelRespawnData data;
+  data.channel          = channel_;
+  data.cancelled_cbs    = 0;
+  data.cancelled_status = ARES_SUCCESS;
+  data.replacement      = &replacement;
+  data.spawned          = false;
+
+  /* Left unanswered, so both are still pending when the channel is
+   * cancelled. */
+  QueryResult other;
+  EXPECT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec(channel_, "www.first.com", ARES_CLASS_IN,
+                              ARES_REC_TYPE_A, CancelRespawnCallback, &data,
+                              NULL));
+  EXPECT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec(channel_, "www.second.com", ARES_CLASS_IN,
+                              ARES_REC_TYPE_A, QueryCallback, &other, NULL));
+  EXPECT_EQ(2, ares_queue_active_queries(channel_));
+
+  ares_cancel(channel_);
+
+  /* Each original lookup must be notified exactly once. */
+  EXPECT_EQ((size_t)1, data.cancelled_cbs);
+  EXPECT_EQ(ARES_ECANCELLED, data.cancelled_status);
+  EXPECT_TRUE(other.done_);
+  EXPECT_EQ(ARES_ECANCELLED, other.status_);
+
+  /* The lookup started from the callback survives the cancel that spawned
+   * it. */
+  EXPECT_FALSE(replacement.done_);
+  EXPECT_EQ(1, ares_queue_active_queries(channel_));
+
+  /* A later ares_cancel() ends it exactly once, with the same status any
+   * normally cancelled lookup gets. */
+  ares_cancel(channel_);
+  EXPECT_TRUE(replacement.done_);
+  EXPECT_EQ(ARES_ECANCELLED, replacement.status_);
+  EXPECT_EQ(0, ares_queue_active_queries(channel_));
+}
+
+/* Repeated cancellation -- reentrant from a callback and sequential from the
+ * caller -- must never notify a lookup twice: the queries being cancelled sit
+ * in a dedicated list the reentrant ares_cancel() does not scan, and once
+ * drained there is nothing left for later calls to find. */
+struct CancelCountData {
+  ares_channel_t *channel;
+  size_t          cbs;
+  ares_status_t   last_status;
+  bool            reenter;
+};
+
+static void CancelCountCallback(void *arg, ares_status_t status,
+                                size_t                   timeouts,
+                                const ares_dns_record_t *dnsrec)
+{
+  CancelCountData *data = static_cast<CancelCountData *>(arg);
+  (void)timeouts;
+  (void)dnsrec;
+  data->cbs++;
+  data->last_status = status;
+
+  if (data->reenter) {
+    /* Reentrant repeated cancel: everything in flight is already on the
+     * cancellation list, so these must find nothing to notify. */
+    ares_cancel(data->channel);
+    ares_cancel(data->channel);
+  }
+}
+
+TEST_P(MockUDPChannelTest, RepeatedCancelNotifiesEachQueryOnce)
+{
+  CancelCountData data;
+  data.channel     = channel_;
+  data.cbs         = 0;
+  data.last_status = ARES_SUCCESS;
+  data.reenter     = true;
+
+  /* Left unanswered, so both are still pending when the channel is
+   * cancelled. */
+  EXPECT_EQ(ARES_SUCCESS, ares_query_dnsrec(channel_, "www.first.com",
+                                            ARES_CLASS_IN, ARES_REC_TYPE_A,
+                                            CancelCountCallback, &data, NULL));
+  EXPECT_EQ(ARES_SUCCESS, ares_query_dnsrec(channel_, "www.second.com",
+                                            ARES_CLASS_IN, ARES_REC_TYPE_A,
+                                            CancelCountCallback, &data, NULL));
+  EXPECT_EQ(2, ares_queue_active_queries(channel_));
+
+  /* The reentrant cancels run from the first callback; the repeats after the
+   * outer call returns must be no-ops. */
+  ares_cancel(channel_);
+  ares_cancel(channel_);
+  ares_cancel(channel_);
+
+  /* Two lookups, two notifications -- no duplicates from any of the
+   * repeats. */
+  EXPECT_EQ((size_t)2, data.cbs);
+  EXPECT_EQ(ARES_ECANCELLED, data.last_status);
+  EXPECT_EQ(0, ares_queue_active_queries(channel_));
+}
+
 // The same shape through ares_destroy() rather than ares_cancel().  Swapping
 // the all_queries head does not help here: the reentrant teardown reaches the
 // query through the connection, not through all_queries.
@@ -2690,6 +2824,101 @@ TEST_P(MockUDPSingleTryTest, ReconfigureInDestroyCallbackNoDoubleFree) {
   EXPECT_TRUE(result.done_);
   /* Each lookup must be notified exactly once, not twice. */
   EXPECT_EQ((size_t)1, data.cbs);
+}
+
+/* Destroy-callback interleaving: the callback both reconfigures the server
+ * list -- tearing down the servers and connections the in-flight lookups are
+ * attached to -- and tries to start a replacement lookup on the channel being
+ * destroyed.  The in-flight lookups must each be notified exactly once, and
+ * the replacement must be refused with ARES_EDESTRUCTION but still notified,
+ * matching NewQueryInDestroyCallbackIsRefusedAndNotified. */
+struct DestroyInterleaveData {
+  ares_channel_t *channel;
+  size_t          outer_cbs;
+  ares_status_t   outer_status[2];
+  size_t          replacement_cbs;
+  ares_status_t   replacement_status;
+  bool            acted;
+};
+
+static void
+  DestroyInterleaveReplacementCallback(void *arg, ares_status_t status,
+                                       size_t                   timeouts,
+                                       const ares_dns_record_t *dnsrec)
+{
+  DestroyInterleaveData *data = static_cast<DestroyInterleaveData *>(arg);
+  (void)timeouts;
+  (void)dnsrec;
+  data->replacement_cbs++;
+  data->replacement_status = status;
+}
+
+static void DestroyInterleaveCallback(void *arg, ares_status_t status,
+                                      size_t                   timeouts,
+                                      const ares_dns_record_t *dnsrec)
+{
+  DestroyInterleaveData *data = static_cast<DestroyInterleaveData *>(arg);
+  (void)timeouts;
+  (void)dnsrec;
+  if (data->outer_cbs < 2) {
+    data->outer_status[data->outer_cbs] = status;
+  }
+  data->outer_cbs++;
+
+  /* Only the first destruction callback acts. */
+  if (data->acted) {
+    return;
+  }
+  data->acted = true;
+
+  /* Frees every server absent from the new configuration while ares_destroy()
+   * is still walking the query list. */
+  ares_set_servers_csv(data->channel, "127.0.0.1:53055");
+
+  /* Refused: the channel is being destroyed. */
+  ares_query_dnsrec(data->channel, "www.replacement.com", ARES_CLASS_IN,
+                    ARES_REC_TYPE_A, DestroyInterleaveReplacementCallback, data,
+                    NULL);
+}
+
+TEST_P(MockUDPSingleTryTest, ReconfigureAndNewQueryInDestroyCallback)
+{
+  DestroyInterleaveData data;
+  data.channel            = channel_;
+  data.outer_cbs          = 0;
+  data.outer_status[0]    = ARES_SUCCESS;
+  data.outer_status[1]    = ARES_SUCCESS;
+  data.replacement_cbs    = 0;
+  data.replacement_status = ARES_SUCCESS;
+  data.acted              = false;
+
+  /* Left unanswered, so both are still pending when the channel goes down. */
+  EXPECT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec(channel_, "www.google.com", ARES_CLASS_IN,
+                              ARES_REC_TYPE_A, DestroyInterleaveCallback, &data,
+                              NULL));
+  EXPECT_EQ(ARES_SUCCESS,
+            ares_query_dnsrec(channel_, "www.example.com", ARES_CLASS_IN,
+                              ARES_REC_TYPE_A, DestroyInterleaveCallback, &data,
+                              NULL));
+  EXPECT_EQ(2, ares_queue_active_queries(channel_));
+
+  ares_destroy(channel_);
+  channel_ = nullptr; /* destroyed here, don't let the fixture repeat it */
+
+  /* Each in-flight lookup must be notified exactly once.  The first is the
+   * one ares_destroy() is walking, so it gets the destruction status; its
+   * callback's reconfiguration then tears the connection down, which ends
+   * the second lookup with its accumulated error status -- tries=1 leaves
+   * no retry -- before ares_destroy() would have reached it. */
+  EXPECT_EQ((size_t)2, data.outer_cbs);
+  EXPECT_EQ(ARES_EDESTRUCTION, data.outer_status[0]);
+  EXPECT_EQ(ARES_ETIMEOUT, data.outer_status[1]);
+
+  /* The replacement lookup is refused but still notified, so the caller can
+   * reclaim whatever it attached to `arg`. */
+  EXPECT_EQ((size_t)1, data.replacement_cbs);
+  EXPECT_EQ(ARES_EDESTRUCTION, data.replacement_status);
 }
 
 // Once ares_destroy() has begun, a lookup started from a destruction callback
