@@ -562,7 +562,8 @@ fail:
 
 ares_status_t ares_dns_name_parse(ares_buf_t *buf, char **name,
                                   ares_bool_t is_hostname,
-                                  ares_bool_t allow_compression)
+                                  ares_bool_t allow_compression,
+                                  size_t     *indir_budget)
 {
   size_t        save_offset = 0;
   unsigned char c;
@@ -658,6 +659,19 @@ ares_status_t ares_dns_name_parse(ares_buf_t *buf, char **name,
       if (indir > ARES_MAX_INDIRS) {
         status = ARES_EBADNAME;
         goto fail;
+      }
+
+      /* Charge the jump against the message-wide budget (when the caller
+       * provided one).  A malicious message can repeat a long pointer chain
+       * in the question and in every RR, so the per-name cap above is not
+       * enough on its own; once the shared budget is spent, fail the whole
+       * message parse with the same error as any other bad name. */
+      if (indir_budget != NULL) {
+        if (*indir_budget == 0) {
+          status = ARES_EBADNAME;
+          goto fail;
+        }
+        (*indir_budget)--;
       }
 
       /* First time we make a jump, save the current position */

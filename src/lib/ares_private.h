@@ -610,6 +610,20 @@ void ares_gethostbyaddr_nolock(ares_channel_t *channel, const void *addr,
                                int addrlen, int family,
                                ares_host_callback callback, void *arg);
 
+/*! Message-wide budget of compression-pointer jumps, shared by every name
+ *  parsed from a single DNS message (question, answer, authority, and
+ *  additional sections).  The per-name indirection cap alone is not
+ *  sufficient: a malicious response can repeat a long pointer chain in the
+ *  question name and in the owner/RDATA names of many resource records,
+ *  multiplying the total pointer-chasing work by the number of records in
+ *  the message.  Legitimate names need only a handful of jumps each
+ *  (typically one, pointing at a prior occurrence of the suffix), so a
+ *  whole-message budget well above anything a compliant message can
+ *  reasonably use still bounds the total work spent following pointers.
+ *  When the budget is exhausted the parse fails with ARES_EBADNAME, same
+ *  as any other malformed name. */
+#define ARES_MAX_MSG_INDIRS 4096
+
 /*! Parse a compressed DNS name as defined in RFC1035 starting at the current
  *  offset within the buffer.
  *
@@ -626,11 +640,17 @@ void ares_gethostbyaddr_nolock(ares_channel_t *channel, const void *addr,
  *                         encountered while parsing the name will be rejected
  *                         with ARES_EBADNAME.  Used for RR types (e.g. SRV)
  *                         whose RDATA names must not use name compression.
+ *  \param[in,out] indir_budget Message-wide compression-pointer jump budget
+ *                         (see ARES_MAX_MSG_INDIRS), decremented once per
+ *                         pointer followed; parsing fails with ARES_EBADNAME
+ *                         when it is exhausted.  Pass NULL to disable the
+ *                         message-wide budget (single-name parses).
  *  \return ARES_SUCCESS on success
  */
 ares_status_t ares_dns_name_parse(ares_buf_t *buf, char **name,
                                   ares_bool_t is_hostname,
-                                  ares_bool_t allow_compression);
+                                  ares_bool_t allow_compression,
+                                  size_t     *indir_budget);
 
 /*! Write the DNS name to the buffer in the DNS domain-name syntax as a
  *  series of labels.  The maximum domain name length is 255 characters with

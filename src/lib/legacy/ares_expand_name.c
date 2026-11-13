@@ -69,7 +69,10 @@ ares_status_t ares_expand_name_validated(const unsigned char *encoded,
   }
 
   start_len = ares_buf_len(buf);
-  status    = ares_dns_name_parse(buf, s, is_hostname, ARES_TRUE);
+  /* Single-name parse: the per-name indirection cap applies, but there is no
+   * message-wide budget to charge (each legacy expand call is its own
+   * operation), so pass NULL. */
+  status    = ares_dns_name_parse(buf, s, is_hostname, ARES_TRUE, NULL);
   if (status != ARES_SUCCESS) {
     goto done;
   }

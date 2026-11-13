@@ -348,6 +348,102 @@ TEST_F(LibraryTest, ParseRejectsPointerChain) {
   EXPECT_EQ(nullptr, dnsrec);
 }
 
+// Build a message carrying a compression-pointer chain of nchain jumps (kept
+// under the per-name indirection cap of 128) inside the opaque rdata of a raw
+// RR, followed by nptr_rrs A records whose owner names each point at the top
+// of the chain.  Each of those names therefore costs nchain + 1 jumps against
+// the message-wide compression-pointer budget.
+static std::vector<byte> PointerChainMessage(int nchain, int nptr_rrs) {
+  std::vector<byte> data = {
+    0x12, 0x34, 0x81, 0x80,
+    0x00, 0x01,  // num questions
+    0x00, 0x00,  // num answer RRs (patched below)
+    0x00, 0x00,  // num authority RRs
+    0x00, 0x00,  // num additional RRs
+    // Question
+    0x01, 'a', 0x00,
+    0x00, 0x01,  // type A
+    0x00, 0x01,  // class IN
+    // RR1: raw RR (unknown type) whose rdata carries the pointer chain
+    0x00,        // name = root
+    0xff, 0xfe,  // type (unknown -> stored raw, rdata not name-parsed)
+    0x00, 0x01,  // class IN
+    0x00, 0x00, 0x00, 0x00,  // TTL
+  };
+  data[7] = static_cast<byte>(1 + nptr_rrs);
+
+  // The chain lives in RR1's rdata, which begins two octets past here (after
+  // the rdlength we are about to write), so compute absolute offsets from
+  // there.
+  const size_t rdata_off = data.size() + 2;
+  std::vector<byte> chain;
+  chain.push_back(0x00);          // deepest target: root terminator
+  size_t prev = rdata_off;        // absolute offset of the root
+  size_t top  = prev;
+  for (int i = 0; i < nchain; i++) {
+    size_t here = rdata_off + chain.size();
+    chain.push_back(0xc0 | ((prev >> 8) & 0x3f));
+    chain.push_back(prev & 0xff);
+    top  = here;
+    prev = here;
+  }
+  data.push_back((chain.size() >> 8) & 0xff);  // rdlength
+  data.push_back(chain.size() & 0xff);
+  data.insert(data.end(), chain.begin(), chain.end());
+
+  // Each remaining RR's owner name is a pointer to the top of the chain.
+  for (int i = 0; i < nptr_rrs; i++) {
+    data.push_back(0xc0 | ((top >> 8) & 0x3f));
+    data.push_back(top & 0xff);
+    std::vector<byte> tail = {
+      0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 1, 2, 3, 4,
+    };
+    data.insert(data.end(), tail.begin(), tail.end());
+  }
+  return data;
+}
+
+TEST_F(LibraryTest, ParseRejectsMessagePointerBudgetExhaustion) {
+  // Each RR name stays under the per-name indirection cap (101 <= 128 jumps),
+  // but together they spend 44 * 101 = 4444 jumps, more than the message-wide
+  // budget of 4096.  The whole message must be rejected with the same error
+  // as any other malformed name, and no partial result may be delivered.
+  std::vector<byte> data = PointerChainMessage(100, 44);
+
+  ares_dns_record_t *dnsrec = NULL;
+  EXPECT_EQ(ARES_EBADNAME, ares_dns_parse(data.data(), data.size(), 0, &dnsrec));
+  EXPECT_EQ(nullptr, dnsrec);
+}
+
+TEST_F(LibraryTest, ParseAcceptsNamesWithinMessagePointerBudget) {
+  // Same shape, but 30 * 101 = 3030 jumps stays within the message-wide
+  // budget, so the parse must succeed.
+  std::vector<byte> data = PointerChainMessage(100, 30);
+
+  ares_dns_record_t *dnsrec = NULL;
+  EXPECT_EQ(ARES_SUCCESS, ares_dns_parse(data.data(), data.size(), 0, &dnsrec));
+  EXPECT_NE(nullptr, dnsrec);
+  ares_dns_record_destroy(dnsrec);
+}
+
+TEST_F(LibraryTest, ParseMessagePointerBudgetNotInherited) {
+  // The budget is per-message: exhausting it on one message must not affect
+  // parsing of the next message.
+  std::vector<byte> bad = PointerChainMessage(100, 44);
+  ares_dns_record_t *dnsrec = NULL;
+  EXPECT_EQ(ARES_EBADNAME, ares_dns_parse(bad.data(), bad.size(), 0, &dnsrec));
+  EXPECT_EQ(nullptr, dnsrec);
+
+  DNSPacket pkt;
+  pkt.set_qid(0x1234).set_response()
+    .add_question(new DNSQuestion("example.com", T_A))
+    .add_answer(new DNSARR("example.com", 100, {0x02, 0x03, 0x04, 0x05}));
+  std::vector<byte> good = pkt.data();
+  EXPECT_EQ(ARES_SUCCESS, ares_dns_parse(good.data(), good.size(), 0, &dnsrec));
+  EXPECT_NE(nullptr, dnsrec);
+  ares_dns_record_destroy(dnsrec);
+}
+
 TEST_F(LibraryTest, ParseAcceptsMaxLengthName) {
   // Exactly 255 presentation octets: 4 x 63 = 252 + 3 separators = 255, which
   // must still be accepted (the bound is "> 255", not ">= 255").
