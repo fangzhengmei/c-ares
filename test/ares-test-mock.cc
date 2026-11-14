@@ -34,6 +34,9 @@
 #ifndef _WIN32
 #  include <errno.h>
 #  include <fcntl.h>
+#  ifdef HAVE_SYS_IOCTL_H
+#    include <sys/ioctl.h>
+#  endif
 #endif
 
 #include <sstream>
@@ -3541,6 +3544,17 @@ struct FakeSockData {
   size_t             sock_state_bad;
   bool               done;
   int                status;
+  /* Fault injection for callback boundary validation.  All default to false
+   * via the memset() in the tests that use this struct. */
+  bool               recv_overlength;     /* lie about the byte count */
+  bool               recv_neg_noerrno;    /* return -1 with errno left at 0 */
+  bool               recv_bad_family;     /* bogus sa_family in source addr */
+  bool               recv_short_addrlen;  /* addr length below sockaddr_in */
+  bool               recv_wrong_addr;     /* valid sockaddr, wrong IP */
+  bool               send_overlength;     /* asendto claims > requested */
+  bool               send_neg_noerrno;    /* asendto -1 with errno at 0 */
+  size_t             recv_fault_remaining; /* fault for N recvs, then answer */
+  unsigned int       tries;               /* 0 leaves ARES_OPT_TRIES unset */
 };
 
 static void FakeSockSetErrno(bool wouldblock)
@@ -3610,11 +3624,30 @@ static ares_ssize_t FakeSockRecvfrom(ares_socket_t sock, void *buffer,
                                      void            *user_data)
 {
   FakeSockData *d = static_cast<FakeSockData *>(user_data);
+  bool          fault_active;
   (void)flags;
   d->recv_calls++;
   if (sock == ARES_SOCKET_BAD) {
     d->bad_fd_calls++;
   }
+
+  /* Hard fault injection: report a failure without leaving an error code.
+   * The library must turn this into a deterministic connection error rather
+   * than reading a stale errno such as EAGAIN. */
+  if (d->recv_neg_noerrno) {
+    errno = 0;
+    return -1;
+  }
+
+  /* Structural faults are armed for a finite number of calls so a retry after
+   * the faulting connection is closed can still receive a valid answer. */
+  fault_active = (d->recv_overlength || d->recv_bad_family ||
+                  d->recv_short_addrlen || d->recv_wrong_addr) &&
+                 d->recv_fault_remaining > 0;
+  if (fault_active) {
+    d->recv_fault_remaining--;
+  }
+
   if (d->query_len < 12 || length < d->query_len) {
     FakeSockSetErrno(true);
     return -1;
@@ -3632,8 +3665,10 @@ static ares_ssize_t FakeSockRecvfrom(ares_socket_t sock, void *buffer,
     d->recv_reconfigure = false;
     // Frees the server this connection belongs to.
     ares_set_servers_csv(d->channel, "127.0.0.1:53056");
-  } else if (d->recv_answer) {
-    d->recv_answer = false;
+  } else if (d->recv_answer || fault_active) {
+    if (d->recv_answer) {
+      d->recv_answer = false;
+    }
   } else {
     FakeSockSetErrno(true);
     return -1;
@@ -3649,7 +3684,26 @@ static ares_ssize_t FakeSockRecvfrom(ares_socket_t sock, void *buffer,
     } else if (d->recv_port != 0) {
       reinterpret_cast<struct sockaddr_in *>(address)->sin_port = d->recv_port;
     }
-    *address_len = sizeof(d->peer);
+    if (d->recv_wrong_addr && fault_active) {
+      reinterpret_cast<struct sockaddr_in *>(address)->sin_addr.s_addr =
+        htonl(0x7f000002u); /* 127.0.0.2, still on loopback */
+    }
+    if (d->recv_bad_family && fault_active) {
+      /* neither AF_INET, AF_INET6 nor AF_UNSPEC */
+      address->sa_family = 0x7fff;
+    }
+    if (d->recv_short_addrlen && fault_active) {
+      *address_len = 1; /* too small for the sockaddr_in that was written */
+    } else {
+      *address_len = sizeof(d->peer);
+    }
+  }
+  /* Only ever write inside the buffer; the lie is in the returned count, so
+   * the test itself never performs an out-of-bounds write.  Without the
+   * boundary check this count would drive ares_buf_append_finish() past the
+   * input buffer's allocation. */
+  if (d->recv_overlength && fault_active) {
+    return static_cast<ares_ssize_t>(length + 16);
   }
   return static_cast<ares_ssize_t>(d->query_len);
 }
@@ -3666,9 +3720,16 @@ static ares_ssize_t FakeSockSendto(ares_socket_t sock, const void *buffer,
   if (sock == ARES_SOCKET_BAD) {
     d->bad_fd_calls++;
   }
+  if (d->send_neg_noerrno) {
+    errno = 0;
+    return -1;
+  }
   if (length <= sizeof(d->query)) {
     memcpy(d->query, buffer, length);
     d->query_len = length;
+  }
+  if (d->send_overlength) {
+    return static_cast<ares_ssize_t>(length + 16);
   }
   return static_cast<ares_ssize_t>(length);
 }
@@ -3738,6 +3799,10 @@ static void FakeSockInit(ares_channel_t **chan, FakeSockData *data,
   memset(&opts, 0, sizeof(opts));
   opts.flags  = ARES_FLAG_NOSEARCH | extra_flags;
   optmask    |= ARES_OPT_FLAGS;
+  if (data->tries != 0) {
+    opts.tries  = data->tries;
+    optmask    |= ARES_OPT_TRIES;
+  }
   // A socket-state callback defers the close of a connection's descriptor
   // until the outermost call unwinds; without one it is closed inline.
   if (sock_state) {
@@ -3947,6 +4012,257 @@ TEST_F(LibraryTest, UDPAnswerWithoutPortAccepted)
   EXPECT_TRUE(data.done);
   // The fake answer carries no records.
   EXPECT_EQ(ARES_ENODATA, data.status);
+  EXPECT_EQ((size_t)0, ares_queue_active_queries(chan));
+  ares_destroy(chan);
+}
+
+// A receive callback that reports more bytes than the buffer it was given
+// must not be able to drive c-ares past the end of its connection input
+// buffer.  The overlength return is converted into a hard connection error;
+// with a single try the query terminates with ARES_ECONNREFUSED and the query
+// callback fires exactly once, so no state is left in flight.
+TEST_F(LibraryTest, RecvOverlengthUDPRejected) {
+  ares_channel_t *chan = nullptr;
+  FakeSockData    data;
+
+  memset(&data, 0, sizeof(data));
+  data.tries          = 1;
+  data.recv_overlength = true;
+  data.recv_fault_remaining = SIZE_MAX;
+  FakeSockInit(&chan, &data, 0, ARES_SOCKFUNC_FLAG_NONBLOCKING);
+
+  ares_query_dnsrec(chan, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A,
+                    FakeSockQueryCallback, &data, NULL);
+  ASSERT_NE((size_t)0, data.query_len);
+
+  ares_process_fd(chan, 100, ARES_SOCKET_BAD);
+  EXPECT_TRUE(data.done);
+  EXPECT_EQ(ARES_ECONNREFUSED, data.status);
+  EXPECT_EQ((size_t)0, ares_queue_active_queries(chan));
+  ares_destroy(chan);
+}
+
+// Same violation over TCP: the connected socket is closed rather than fed a
+// fabricated length, and the retry budget still bounds the failure.
+TEST_F(LibraryTest, RecvOverlengthTCPRejected) {
+  ares_channel_t *chan = nullptr;
+  FakeSockData    data;
+
+  memset(&data, 0, sizeof(data));
+  data.tries           = 1;
+  data.recv_overlength = true;
+  data.recv_fault_remaining = SIZE_MAX;
+  FakeSockInit(&chan, &data, ARES_FLAG_USEVC, ARES_SOCKFUNC_FLAG_NONBLOCKING);
+
+  ares_query_dnsrec(chan, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A,
+                    FakeSockQueryCallback, &data, NULL);
+
+  // Drive the TCP connection to established and flush the first write.
+  ares_process_fd(chan, ARES_SOCKET_BAD, 100);
+  ASSERT_NE((size_t)0, data.query_len);
+
+  // The first read returns an impossible length and must fail the connection.
+  ares_process_fd(chan, 100, ARES_SOCKET_BAD);
+  EXPECT_TRUE(data.done);
+  EXPECT_EQ(ARES_ECONNREFUSED, data.status);
+  EXPECT_EQ((size_t)0, ares_queue_active_queries(chan));
+  ares_destroy(chan);
+}
+
+// A negative receive result with no errno must be a deterministic failure.
+// Left unvalidated, a stale EAGAIN would map to WOULDBLOCK and strand the
+// query waiting for an event that never arrives.
+TEST_F(LibraryTest, RecvNegativeNoErrnoUDP) {
+  ares_channel_t *chan = nullptr;
+  FakeSockData    data;
+
+  memset(&data, 0, sizeof(data));
+  data.tries             = 1;
+  data.recv_neg_noerrno  = true;
+  FakeSockInit(&chan, &data, 0, ARES_SOCKFUNC_FLAG_NONBLOCKING);
+
+  ares_query_dnsrec(chan, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A,
+                    FakeSockQueryCallback, &data, NULL);
+  ASSERT_NE((size_t)0, data.query_len);
+
+  ares_process_fd(chan, 100, ARES_SOCKET_BAD);
+  EXPECT_TRUE(data.done);
+  EXPECT_EQ(ARES_ECONNREFUSED, data.status);
+  EXPECT_EQ((size_t)0, ares_queue_active_queries(chan));
+  ares_destroy(chan);
+}
+
+TEST_F(LibraryTest, RecvNegativeNoErrnoTCP) {
+  ares_channel_t *chan = nullptr;
+  FakeSockData    data;
+
+  memset(&data, 0, sizeof(data));
+  data.tries             = 1;
+  data.recv_neg_noerrno  = true;
+  FakeSockInit(&chan, &data, ARES_FLAG_USEVC,
+               ARES_SOCKFUNC_FLAG_NONBLOCKING);
+
+  ares_query_dnsrec(chan, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A,
+                    FakeSockQueryCallback, &data, NULL);
+
+  // Establish the TCP connection and flush the buffered query first.
+  ares_process_fd(chan, ARES_SOCKET_BAD, 100);
+  ASSERT_NE((size_t)0, data.query_len);
+
+  // The read fails without an errno and must not strand the query.
+  ares_process_fd(chan, 100, ARES_SOCKET_BAD);
+  EXPECT_TRUE(data.done);
+  EXPECT_EQ(ARES_ECONNREFUSED, data.status);
+  EXPECT_EQ((size_t)0, ares_queue_active_queries(chan));
+  ares_destroy(chan);
+}
+
+// A source sockaddr with an address family c-ares does not handle cannot be
+// matched against any server and must be rejected at the boundary instead of
+// reaching the parser.
+TEST_F(LibraryTest, RecvInvalidSockaddrFamily) {
+  ares_channel_t *chan = nullptr;
+  FakeSockData    data;
+
+  memset(&data, 0, sizeof(data));
+  data.tries                 = 1;
+  data.recv_bad_family       = true;
+  data.recv_fault_remaining  = SIZE_MAX;
+  FakeSockInit(&chan, &data, 0, ARES_SOCKFUNC_FLAG_NONBLOCKING);
+
+  ares_query_dnsrec(chan, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A,
+                    FakeSockQueryCallback, &data, NULL);
+  ASSERT_NE((size_t)0, data.query_len);
+
+  ares_process_fd(chan, 100, ARES_SOCKET_BAD);
+  EXPECT_TRUE(data.done);
+  EXPECT_EQ(ARES_ECONNREFUSED, data.status);
+  EXPECT_EQ((size_t)0, ares_queue_active_queries(chan));
+  ares_destroy(chan);
+}
+
+// A reported source-address length smaller than the sockaddr it describes is
+// likewise unusable and must fail the connection rather than the parse.
+TEST_F(LibraryTest, RecvShortSockaddrLen) {
+  ares_channel_t *chan = nullptr;
+  FakeSockData    data;
+
+  memset(&data, 0, sizeof(data));
+  data.tries                    = 1;
+  data.recv_short_addrlen       = true;
+  data.recv_fault_remaining     = SIZE_MAX;
+  FakeSockInit(&chan, &data, 0, ARES_SOCKFUNC_FLAG_NONBLOCKING);
+
+  ares_query_dnsrec(chan, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A,
+                    FakeSockQueryCallback, &data, NULL);
+  ASSERT_NE((size_t)0, data.query_len);
+
+  ares_process_fd(chan, 100, ARES_SOCKET_BAD);
+  EXPECT_TRUE(data.done);
+  EXPECT_EQ(ARES_ECONNREFUSED, data.status);
+  EXPECT_EQ((size_t)0, ares_queue_active_queries(chan));
+  ares_destroy(chan);
+}
+
+// A structurally valid datagram from the wrong source address is not a
+// connection fault: per RFC 5452 section 9.1 it is silently dropped (mapped
+// to WOULDBLOCK), leaving the query in flight and its state untouched.  The
+// same query answered from the correct address then completes normally.
+TEST_F(LibraryTest, UDPAnswerFromWrongAddressDropped) {
+  ares_channel_t *chan = nullptr;
+  FakeSockData    data;
+
+  memset(&data, 0, sizeof(data));
+  data.recv_wrong_addr       = true;
+  data.recv_fault_remaining  = 1;
+  FakeSockInit(&chan, &data, 0, ARES_SOCKFUNC_FLAG_NONBLOCKING);
+
+  ares_query_dnsrec(chan, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A,
+                    FakeSockQueryCallback, &data, NULL);
+  ASSERT_NE((size_t)0, data.query_len);
+
+  // First read reports a valid sockaddr from another address; it is dropped
+  // and the query stays queued on the same connection.
+  ares_process_fd(chan, 100, ARES_SOCKET_BAD);
+  EXPECT_FALSE(data.done);
+  EXPECT_EQ((size_t)1, ares_queue_active_queries(chan));
+
+  // The retry answer uses the real server address and succeeds.
+  data.recv_answer = true;
+  ares_process_fd(chan, 100, ARES_SOCKET_BAD);
+  EXPECT_TRUE(data.done);
+  EXPECT_EQ(ARES_ENODATA, data.status);
+  EXPECT_EQ((size_t)0, ares_queue_active_queries(chan));
+  ares_destroy(chan);
+}
+
+// A hard callback fault spends one attempt: the faulting connection closes and
+// its query is requeued.  With tries=2 a subsequent valid answer on the fresh
+// connection completes the query without surfacing the fault to the caller.
+TEST_F(LibraryTest, RecvFaultThenRetrySucceeds) {
+  ares_channel_t *chan = nullptr;
+  FakeSockData    data;
+
+  memset(&data, 0, sizeof(data));
+  data.tries                 = 2;
+  data.recv_overlength       = true;
+  data.recv_fault_remaining  = 1;
+  FakeSockInit(&chan, &data, 0, ARES_SOCKFUNC_FLAG_NONBLOCKING);
+
+  ares_query_dnsrec(chan, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A,
+                    FakeSockQueryCallback, &data, NULL);
+  ASSERT_NE((size_t)0, data.query_len);
+
+  // First connection read hits the overlength fault and is torn down; the
+  // query is requeued rather than terminated.
+  ares_process_fd(chan, 100, ARES_SOCKET_BAD);
+  EXPECT_FALSE(data.done);
+  EXPECT_EQ((size_t)1, ares_queue_active_queries(chan));
+
+  // Second connection (next fake descriptor, 101) answers correctly.
+  data.recv_answer = true;
+  ares_process_fd(chan, 101, ARES_SOCKET_BAD);
+  EXPECT_TRUE(data.done);
+  EXPECT_EQ(ARES_ENODATA, data.status);
+  EXPECT_EQ((size_t)0, ares_queue_active_queries(chan));
+  ares_destroy(chan);
+}
+
+// The send boundary is validated too: a byte count above the requested length
+// cannot desync the output buffer.  It fails the connection and, with one try,
+// terminates the query through the same budget as receive faults.
+TEST_F(LibraryTest, SendOverlengthRejected) {
+  ares_channel_t *chan = nullptr;
+  FakeSockData    data;
+
+  memset(&data, 0, sizeof(data));
+  data.tries            = 1;
+  data.send_overlength  = true;
+  FakeSockInit(&chan, &data, 0, ARES_SOCKFUNC_FLAG_NONBLOCKING);
+
+  ares_query_dnsrec(chan, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A,
+                    FakeSockQueryCallback, &data, NULL);
+  EXPECT_TRUE(data.done);
+  EXPECT_EQ(ARES_ECONNREFUSED, data.status);
+  EXPECT_EQ((size_t)0, ares_queue_active_queries(chan));
+  ares_destroy(chan);
+}
+
+// A negative send result with no error code is a deterministic failure rather
+// than a retry based on a stale EAGAIN.
+TEST_F(LibraryTest, SendNegativeNoErrno) {
+  ares_channel_t *chan = nullptr;
+  FakeSockData    data;
+
+  memset(&data, 0, sizeof(data));
+  data.tries              = 1;
+  data.send_neg_noerrno   = true;
+  FakeSockInit(&chan, &data, 0, ARES_SOCKFUNC_FLAG_NONBLOCKING);
+
+  ares_query_dnsrec(chan, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A,
+                    FakeSockQueryCallback, &data, NULL);
+  EXPECT_TRUE(data.done);
+  EXPECT_EQ(ARES_ECONNREFUSED, data.status);
   EXPECT_EQ((size_t)0, ares_queue_active_queries(chan));
   ares_destroy(chan);
 }
@@ -6002,6 +6318,179 @@ TEST_P(ReplyConnCookieMultiMockTest, CookielessAnswerOnOtherServerDropped) {
 INSTANTIATE_TEST_SUITE_P(TransportModes, ReplyConnMultiMockTest, ::testing::ValuesIn(ares::test::families_modes), PrintFamilyMode);
 
 INSTANTIATE_TEST_SUITE_P(AddressFamilies, ReplyConnCookieMultiMockTest, ::testing::ValuesIn(ares::test::families), PrintFamily);
+
+// Pass-through implementations of the extended socket functions: every call
+// is handed straight to the OS.  Installing them proves the boundary
+// validation in ares_socket.c does not reject or alter traffic from a
+// compliant callback.
+static int passthrough_set_nonblocking(ares_socket_t sock)
+{
+#if defined(USE_BLOCKING_SOCKETS)
+  (void)sock;
+  return 0;
+#elif defined(HAVE_FCNTL_O_NONBLOCK)
+  int flags = fcntl(sock, F_GETFL, 0);
+  return fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+#elif defined(HAVE_IOCTL_FIONBIO)
+  int flags = 1;
+  return ioctl(sock, FIONBIO, &flags);
+#elif defined(HAVE_IOCTLSOCKET_FIONBIO)
+  unsigned long flags = 1UL;
+  return ioctlsocket(sock, (long)FIONBIO, &flags);
+#else
+#  error "no non-blocking method was found/used/set"
+#endif
+}
+
+static ares_socket_t passthrough_socket(int domain, int type, int protocol,
+                                        void *user_data)
+{
+  ares_socket_t sock;
+  (void)user_data;
+  sock = ::socket(domain, type, protocol);
+  if (sock == ARES_SOCKET_BAD) {
+    return sock;
+  }
+  if (passthrough_set_nonblocking(sock) != 0) {
+    sclose(sock);
+    return ARES_SOCKET_BAD;
+  }
+  return sock;
+}
+
+static int passthrough_close(ares_socket_t sock, void *user_data)
+{
+  (void)user_data;
+  return sclose(sock);
+}
+
+static int passthrough_setsockopt(ares_socket_t sock, ares_socket_opt_t opt,
+                                  const void *val, ares_socklen_t val_size,
+                                  void *user_data)
+{
+  (void)user_data;
+  switch (opt) {
+    case ARES_SOCKET_OPT_SENDBUF_SIZE:
+      return setsockopt(sock, SOL_SOCKET, SO_SNDBUF, val,
+                        (ares_socklen_t)val_size);
+    case ARES_SOCKET_OPT_RECVBUF_SIZE:
+      return setsockopt(sock, SOL_SOCKET, SO_RCVBUF, val,
+                        (ares_socklen_t)val_size);
+    default:
+      errno = ENOSYS;
+      return -1;
+  }
+}
+
+static int passthrough_connect(ares_socket_t sock,
+                               const struct sockaddr *address,
+                               ares_socklen_t address_len, unsigned int flags,
+                               void *user_data)
+{
+  (void)flags;
+  (void)user_data;
+  return connect(sock, address, (ares_socklen_t)address_len);
+}
+
+static ares_ssize_t passthrough_recvfrom(ares_socket_t sock, void *buffer,
+                                         size_t length, int flags,
+                                         struct sockaddr *address,
+                                         ares_socklen_t  *address_len,
+                                         void            *user_data)
+{
+  (void)user_data;
+  if (address != NULL && address_len != NULL) {
+    return (ares_ssize_t)recvfrom(sock, buffer, length, flags, address,
+                                  (ares_socklen_t *)address_len);
+  }
+  return (ares_ssize_t)recv(sock, buffer, length, flags);
+}
+
+static ares_ssize_t passthrough_sendto(ares_socket_t sock, const void *buffer,
+                                       size_t length, int flags,
+                                       const struct sockaddr *address,
+                                       ares_socklen_t address_len,
+                                       void *user_data)
+{
+  (void)user_data;
+  if (address != NULL) {
+    return (ares_ssize_t)sendto(sock, buffer, length, flags, address,
+                                (ares_socklen_t)address_len);
+  }
+  return (ares_ssize_t)send(sock, buffer, length, flags);
+}
+
+static int passthrough_getsockname(ares_socket_t        sock,
+                                   struct sockaddr      *address,
+                                   ares_socklen_t       *address_len,
+                                   void                 *user_data)
+{
+  (void)user_data;
+  return getsockname(sock, address, (ares_socklen_t *)address_len);
+}
+
+static const struct ares_socket_functions_ex passthrough_sock_funcs = {
+  1,
+  ARES_SOCKFUNC_FLAG_NONBLOCKING,
+  passthrough_socket,
+  passthrough_close,
+  passthrough_setsockopt,
+  passthrough_connect,
+  passthrough_recvfrom,
+  passthrough_sendto,
+  passthrough_getsockname,
+  NULL, /* abind */
+  NULL, /* aif_nametoindex */
+  NULL  /* aif_indextoname */
+};
+
+// A compliant extended callback set must still be able to complete a normal
+// UDP query end to end against the mock server.
+TEST_P(MockUDPChannelTest, PassThroughSocketFunctionsQuery) {
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_set_socket_functions_ex(channel_, &passthrough_sock_funcs,
+                                         NULL));
+
+  DNSPacket rsp;
+  rsp.set_response().set_aa()
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 100, {1, 2, 3, 4}));
+  EXPECT_CALL(server_, OnRequest("www.google.com", T_A))
+    .WillOnce(SetReply(&server_, &rsp));
+
+  HostResult result;
+  ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback,
+                     &result);
+  Process();
+  EXPECT_TRUE(result.done_);
+  std::stringstream ss;
+  ss << result.host_;
+  EXPECT_EQ("{'www.google.com' aliases=[] addrs=[1.2.3.4]}", ss.str());
+}
+
+// Same guarantee for a TCP query, which exercises ares_socket_recv() (no
+// source address) and the send path through the pass-through callbacks.
+TEST_P(MockTCPChannelTest, PassThroughSocketFunctionsQuery) {
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_set_socket_functions_ex(channel_, &passthrough_sock_funcs,
+                                         NULL));
+
+  DNSPacket rsp;
+  rsp.set_response().set_aa()
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 100, {1, 2, 3, 4}));
+  EXPECT_CALL(server_, OnRequest("www.google.com", T_A))
+    .WillOnce(SetReply(&server_, &rsp));
+
+  HostResult result;
+  ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback,
+                     &result);
+  Process();
+  EXPECT_TRUE(result.done_);
+  std::stringstream ss;
+  ss << result.host_;
+  EXPECT_EQ("{'www.google.com' aliases=[] addrs=[1.2.3.4]}", ss.str());
+}
 
 }  // namespace test
 }  // namespace ares

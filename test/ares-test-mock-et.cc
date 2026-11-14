@@ -220,6 +220,49 @@ TEST_P(MockUDPEventThreadTest, DownServer) {
   EXPECT_NE(0, result.timeouts_);
 }
 
+// A receive callback that lies about the length must be stopped at the
+// callback boundary even when the event thread drives processing.  The query
+// must still complete (its deferred callback notification delivered), rather
+// than hang or parse unvalidated data.
+static ares_ssize_t fault_recvfrom(ares_socket_t sock, void *buffer,
+                                   size_t length, int flags,
+                                   struct sockaddr *address,
+                                   ares_socklen_t  *address_len,
+                                   void            *user_data)
+{
+  (void)sock;
+  (void)buffer;
+  (void)flags;
+  (void)address;
+  (void)address_len;
+  (void)user_data;
+  /* Report more bytes than the buffer could hold.  No data is written; the
+   * boundary validation must reject the returned count. */
+  return (ares_ssize_t)(length + 16);
+}
+
+TEST_P(MockUDPEventThreadTest, RecvFaultFailsQuery) {
+  struct ares_socket_functions_ex fault_sock_funcs;
+  memset(&fault_sock_funcs, 0, sizeof(fault_sock_funcs));
+  fault_sock_funcs.version     = 1;
+  fault_sock_funcs.flags       = ARES_SOCKFUNC_FLAG_NONBLOCKING;
+  fault_sock_funcs.asocket     = noop_socket;
+  fault_sock_funcs.aclose      = noop_close;
+  fault_sock_funcs.asetsockopt = noop_setsockopt;
+  fault_sock_funcs.aconnect    = noop_connect;
+  fault_sock_funcs.arecvfrom   = fault_recvfrom;
+  fault_sock_funcs.asendto     = noop_sendto;
+  ares_set_socket_functions_ex(channel_, &fault_sock_funcs, NULL);
+
+  QueryResult result;
+  ares_query_dnsrec(channel_, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A,
+                    QueryCallback, &result, NULL);
+  ares_queue_wait_empty(channel_, -1);
+  EXPECT_TRUE(result.done_);
+  EXPECT_NE(ARES_SUCCESS, result.status_);
+  EXPECT_NE(0, result.timeouts_);
+}
+
 // UDP to TCP specific test
 TEST_P(MockUDPEventThreadTest, TruncationRetry) {
   DNSPacket rsptruncated;

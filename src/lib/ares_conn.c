@@ -264,7 +264,14 @@ ares_conn_err_t ares_conn_read(ares_conn_t *conn, void *data, size_t len,
      * functions connect() the socket, so the kernel drops a datagram from
      * port 0, and an unprivileged process on the server's host cannot send
      * from port 0, while an off-path attacker able to forge port 0 can forge
-     * the server's real port just as easily. */
+     * the server's real port just as easily.
+     *
+     * The sockaddr's structure itself (address family and reported length) is
+     * validated at the callback boundary in ares_socket_recvfrom_core(); a
+     * malformed structure is turned into a hard connection error before it can
+     * reach this comparison.  Here we only handle a well-formed address that
+     * does not semantically match the queried server, which is dropped like a
+     * stray datagram rather than treated as a connection failure. */
     if (err == ARES_CONN_ERR_SUCCESS &&
         !ares_sockaddr_addr_port_eq((struct sockaddr *)&sa_storage,
                                     &conn->server->addr,

@@ -97,6 +97,75 @@ static ares_conn_err_t ares_socket_deref_error(int err)
   return ARES_CONN_ERR_FAILURE;
 }
 
+/*! Map the error code left by a socket callback that reported failure
+ *  (a negative return value).  A compliant callback sets errno (or
+ *  WSASetLastError()); one that returns a negative value without doing so
+ *  would otherwise leave SOCKERRNO at zero or at a stale value set by an
+ *  unrelated call -- for example a leftover EAGAIN, which would make a hard
+ *  failure look like ARES_CONN_ERR_WOULDBLOCK and strand the query waiting
+ *  for an event that never comes.  Treat the missing error code as a generic
+ *  failure so the connection goes through the normal error/retry path.
+ *
+ *  \return Connection error mapped from SOCKERRNO, or ARES_CONN_ERR_FAILURE
+ *          when the callback left no error code.
+ */
+static ares_conn_err_t ares_socket_deref_negative(void)
+{
+  if (SOCKERRNO == 0) {
+    SET_SOCKERRNO(EIO);
+  }
+  return ares_socket_deref_error(SOCKERRNO);
+}
+
+/*! Validate the structure of a source sockaddr handed back by an
+ *  application-provided receive callback.  Only the structure is checked
+ *  here; whether the address actually matches the queried server is a
+ *  separate semantic check in ares_conn_read() (RFC 5452 section 9.1).
+ *
+ *  \param[in] from      Source address buffer the callback was asked to fill,
+ *                       or NULL when no address was requested.
+ *  \param[in] from_len  Pointer to the address length, or NULL alongside a
+ *                       NULL from.
+ *  \return ARES_CONN_ERR_SUCCESS when the structure is well-formed or no
+ *          address was provided; ARES_CONN_ERR_INVALID otherwise.
+ */
+static ares_conn_err_t
+  ares_socket_validate_recv_addr(const struct sockaddr    *from,
+                                 const ares_socklen_t     *from_len)
+{
+  size_t addr_len;
+
+  if (from == NULL || from_len == NULL) {
+    return ARES_CONN_ERR_SUCCESS;
+  }
+
+  if (*from_len <= 0) {
+    return ARES_CONN_ERR_INVALID;
+  }
+  addr_len = (size_t)*from_len;
+
+  switch (from->sa_family) {
+    case AF_INET:
+      if (addr_len < sizeof(struct sockaddr_in)) {
+        return ARES_CONN_ERR_INVALID;
+      }
+      break;
+    case AF_INET6:
+      if (addr_len < sizeof(struct sockaddr_in6)) {
+        return ARES_CONN_ERR_INVALID;
+      }
+      break;
+    case AF_UNSPEC:
+      /* The callback did not report a source address.  The semantic check in
+       * ares_conn_read() drops the datagram where an address is required. */
+      break;
+    default:
+      return ARES_CONN_ERR_INVALID;
+  }
+
+  return ARES_CONN_ERR_SUCCESS;
+}
+
 ares_bool_t ares_sockaddr_addr_eq(const struct sockaddr  *sa,
                                   const struct ares_addr *aa)
 {
@@ -168,49 +237,54 @@ ares_conn_err_t ares_socket_write(ares_channel_t *channel, ares_socket_t fd,
 
   rv = channel->sock_funcs.asendto(fd, data, len, flags, sa, salen,
                                    channel->sock_func_cb_data);
-  if (rv <= 0) {
-    err = ares_socket_deref_error(SOCKERRNO);
-  } else {
-    *written = (size_t)rv;
-  }
-  return err;
-}
-
-ares_conn_err_t ares_socket_recv(ares_channel_t *channel, ares_socket_t s,
-                                 ares_bool_t is_tcp, void *data,
-                                 size_t data_len, size_t *read_bytes)
-{
-  ares_ssize_t rv;
-
-  *read_bytes = 0;
-
-  rv = channel->sock_funcs.arecvfrom(s, data, data_len, 0, NULL, 0,
-                                     channel->sock_func_cb_data);
-
   if (rv > 0) {
-    *read_bytes = (size_t)rv;
+    if ((size_t)rv > len) {
+      /* The callback claims to have written more than it was given.  Never
+       * report an impossible byte count to the caller, which would desync its
+       * output buffer tracking. */
+      SET_SOCKERRNO(EMSGSIZE);
+      return ARES_CONN_ERR_TOOLARGE;
+    }
+    *written = (size_t)rv;
     return ARES_CONN_ERR_SUCCESS;
   }
 
   if (rv == 0) {
-    /* UDP allows 0-byte packets and is connectionless, so this is success */
-    if (!is_tcp) {
-      return ARES_CONN_ERR_SUCCESS;
-    } else {
-      return ARES_CONN_ERR_CONNCLOSED;
-    }
+    err = ares_socket_deref_error(SOCKERRNO);
+  } else {
+    err = ares_socket_deref_negative();
   }
-
-  /* If we're here, rv<0 */
-  return ares_socket_deref_error(SOCKERRNO);
+  return err;
 }
 
-ares_conn_err_t ares_socket_recvfrom(ares_channel_t *channel, ares_socket_t s,
-                                     ares_bool_t is_tcp, void *data,
-                                     size_t data_len, int flags,
-                                     struct sockaddr *from,
-                                     ares_socklen_t  *from_len,
-                                     size_t          *read_bytes)
+/*! Core receive path shared by ares_socket_recv() and
+ *  ares_socket_recvfrom().  The receive callback is application code, so every
+ *  value it returns is validated here before anything it produced reaches the
+ *  DNS parser:
+ *  - a length larger than the destination buffer is rejected instead of
+ *    overflowing the connection's input buffer;
+ *  - a negative result without an error code is mapped to a deterministic
+ *    failure rather than a stale errno such as EAGAIN;
+ *  - the source sockaddr, when requested, must be well-formed.
+ *
+ *  \param[in]     channel     Channel owning the socket functions.
+ *  \param[in]     s           Socket to read from.
+ *  \param[in]     is_tcp      ARES_TRUE for a connected TCP socket.
+ *  \param[out]    data        Destination buffer.
+ *  \param[in]     data_len    Size of the destination buffer.
+ *  \param[in]     flags       Flags passed to the callback.
+ *  \param[in,out] from        Source address buffer, or NULL.
+ *  \param[in,out] from_len    Source address length pointer, or NULL.
+ *  \param[out]    read_bytes  Number of validated bytes read.
+ *  \return ARES_CONN_ERR_SUCCESS on success (including a 0-byte UDP datagram),
+ *          ARES_CONN_ERR_CONNCLOSED on a TCP peer shutdown, or a deterministic
+ *          connection error when the callback misbehaved or failed.
+ */
+static ares_conn_err_t
+  ares_socket_recvfrom_core(ares_channel_t *channel, ares_socket_t s,
+                            ares_bool_t is_tcp, void *data, size_t data_len,
+                            int flags, struct sockaddr *from,
+                            ares_socklen_t *from_len, size_t *read_bytes)
 {
   ares_ssize_t rv;
 
@@ -220,6 +294,24 @@ ares_conn_err_t ares_socket_recvfrom(ares_channel_t *channel, ares_socket_t s,
                                      channel->sock_func_cb_data);
 
   if (rv > 0) {
+    ares_conn_err_t err;
+
+    /* The returned length must not exceed the buffer the callback was given.
+     * A lying callback must not be allowed to make the caller consume or
+     * parse memory past the end of its buffer. */
+    if ((size_t)rv > data_len) {
+      SET_SOCKERRNO(EMSGSIZE);
+      return ARES_CONN_ERR_TOOLARGE;
+    }
+
+    /* Validate the structure of any source address before a semantic
+     * comparison against the queried server can touch it. */
+    err = ares_socket_validate_recv_addr(from, from_len);
+    if (err != ARES_CONN_ERR_SUCCESS) {
+      SET_SOCKERRNO(EINVAL);
+      return err;
+    }
+
     *read_bytes = (size_t)rv;
     return ARES_CONN_ERR_SUCCESS;
   }
@@ -234,7 +326,26 @@ ares_conn_err_t ares_socket_recvfrom(ares_channel_t *channel, ares_socket_t s,
   }
 
   /* If we're here, rv<0 */
-  return ares_socket_deref_error(SOCKERRNO);
+  return ares_socket_deref_negative();
+}
+
+ares_conn_err_t ares_socket_recv(ares_channel_t *channel, ares_socket_t s,
+                                 ares_bool_t is_tcp, void *data,
+                                 size_t data_len, size_t *read_bytes)
+{
+  return ares_socket_recvfrom_core(channel, s, is_tcp, data, data_len, 0, NULL,
+                                   NULL, read_bytes);
+}
+
+ares_conn_err_t ares_socket_recvfrom(ares_channel_t *channel, ares_socket_t s,
+                                     ares_bool_t is_tcp, void *data,
+                                     size_t data_len, int flags,
+                                     struct sockaddr *from,
+                                     ares_socklen_t  *from_len,
+                                     size_t          *read_bytes)
+{
+  return ares_socket_recvfrom_core(channel, s, is_tcp, data, data_len, flags,
+                                   from, from_len, read_bytes);
 }
 
 ares_conn_err_t ares_socket_enable_tfo(const ares_channel_t *channel,

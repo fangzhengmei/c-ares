@@ -149,6 +149,14 @@ a socket. Additional flags controlling behavior are in
 address, the callback should fill this in. The \fIflags\fP parameter is
 currently unused. See \fBrecvfrom(2)\fP.
 
+The returned byte count must never exceed \fIbuf_size\fP, and a negative return
+must be accompanied by an appropriate errno (or WSASetLastError()); when an
+\fIaddr\fP buffer is provided, it must contain a complete sockaddr whose length
+matches its address family. c-ares validates these values at the callback
+boundary and treats any violation as a connection error: the offending data is
+never parsed, the connection is closed, and its queries are retried subject to
+the normal retry budget.
+
 For UDP, the callback must fill in the full source address, including the
 source port, exactly as \fBrecvfrom(2)\fP does. c-ares discards a datagram
 whose source address does not match the server it queried, or whose source
@@ -170,7 +178,10 @@ port.
 endpoint. The \fIflags\fP member may be used on systems that have
 \fBMSG_NOSIGNAL\fP defined but is otherwise unused.  An \fIaddress\fP is
 provided primarily to support TCP FastOpen scenarios, which will be NULL in
-other circumstances. See \fBsendto(2)\fP.
+other circumstances. See \fBsendto(2)\fP. The returned byte count must not
+exceed \fIlength\fP, and a negative return must set errno (or
+WSASetLastError()); a violation is treated as a connection error and the
+unsent data is retried on another connection subject to the retry budget.
 
 .TP 8
 .B int (*\fIagetsockname\fP)(ares_socket_t \fIfd\fP, struct sockaddr * \fIaddress\fP, ares_socklen_t * \fIaddress_len\fP, void * \fIuser_data\fP)
@@ -318,6 +329,12 @@ Initiate a connection to the address indicated by \fIaddr\fP on a socket. See
 Receives data from remote socket endpoint, if available. If the \fIaddr\fP
 parameter is not NULL and the connection protocol provides the source address,
 the callback should fill this in. See \fBrecvfrom(2)\fP
+
+The returned byte count must never exceed \fIbuf_size\fP, a negative return
+must be accompanied by an appropriate errno, and a provided \fIaddr\fP must be
+a complete sockaddr matching its address family. c-ares validates these values
+and converts a violation into a connection error rather than parsing the
+reported data.
 
 For UDP, the callback must fill in the full source address, including the
 source port, as described above for \fIarecvfrom\fP in
