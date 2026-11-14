@@ -1152,6 +1152,21 @@ static ares_status_t process_answer(ares_channel_t      *channel,
    * that have non-compliant implementations.  Lets try to detect this sort
    * of thing. */
   if (issue_might_be_edns(query->query, rdnsrec)) {
+    /* The downgrade requeues the query without consuming the normal try
+     * budget (try_count), so it is bounded by its own budget: a server that
+     * keeps answering FORMERR must not keep the query resending forever.
+     * Unreachable in practice -- rewrite_without_edns() strips the OPT
+     * record, so a later FORMERR no longer matches issue_might_be_edns() --
+     * but the state machine must not rely on that alone. */
+    if (query->edns_try_count >= ARES_QUERY_MAX_EDNS_TRIES) {
+      /* LCOV_EXCL_START: DefensiveCoding */
+      end_query(channel, server, query, ARES_EFORMERR, NULL, requeue);
+      status = ARES_SUCCESS;
+      goto cleanup;
+      /* LCOV_EXCL_STOP: DefensiveCoding */
+    }
+
+    query->edns_try_count++;
     status = rewrite_without_edns(query);
     if (status != ARES_SUCCESS) {
       end_query(channel, server, query, status, NULL, requeue);
@@ -1163,13 +1178,26 @@ static ares_status_t process_answer(ares_channel_t      *channel,
     goto cleanup;
   }
 
-  /* If we got a truncated UDP packet and are not ignoring truncation,
-   * don't accept the packet, and switch the query to TCP if we hadn't
-   * done so already.
-   */
+  /* Truncation handling.  RFC 1035 4.2.1: a UDP response may carry TC to
+   * direct the client to retry over TCP.  A TCP response carries the
+   * complete answer (RFC 1035 4.2.2), so TC from a TCP peer is always
+   * malformed.  The UDP->TCP switch requeues the query without consuming
+   * the normal try budget (try_count), so it is bounded by its own budget:
+   * a server that answers every response with TC set must not keep the
+   * query resending forever. */
   if (ares_dns_record_get_flags(rdnsrec) & ARES_FLAG_TC &&
-      !(conn->flags & ARES_CONN_FLAG_TCP) &&
       !(channel->flags & ARES_FLAG_IGNTC)) {
+    if ((conn->flags & ARES_CONN_FLAG_TCP) ||
+        query->tc_try_count >= ARES_QUERY_MAX_TC_TRIES) {
+      /* No further transport to fall back to.  Fail the query with an
+       * observable error rather than accepting a truncated answer as if it
+       * were complete or requeueing the query. */
+      end_query(channel, server, query, ARES_EBADRESP, NULL, requeue);
+      status = ARES_SUCCESS;
+      goto cleanup;
+    }
+
+    query->tc_try_count++;
     query->using_tcp = ARES_TRUE;
     status           = ares_append_requeue(requeue, query, NULL);
     /* Status will reflect success except on memory error, which is good since

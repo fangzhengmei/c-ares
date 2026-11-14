@@ -139,6 +139,27 @@ W32_FUNC const char *_w32_GetHostsFile(void);
  * servers once it comes back online. */
 #define SERVER_CONSEC_FAILURES_CAP 16
 
+/* Budgets for the downgrade transitions of the response state machine.
+ *
+ * Some server answers do not resolve a query but tell us to retry it in a
+ * degraded form: a truncated (TC) UDP answer sends us to TCP, and a FORMERR
+ * answer to an EDNS query sends us back without EDNS.  These transitions
+ * requeue the query without consuming the normal try budget (try_count),
+ * so each one carries its own per-query budget instead.  A hostile or
+ * broken server could otherwise keep a query bouncing between states
+ * forever -- e.g. answering every UDP query with TC and every TCP query
+ * with TC again.  When a budget is exhausted the query is terminated with
+ * an observable error rather than requeued.
+ *
+ * The values match what the protocol allows: once a query runs over TCP
+ * there is no further transport to fall back to (RFC 1035 4.2.2), and once
+ * the OPT record has been stripped there is no further EDNS feature to
+ * disable, so a single downgrade of each kind is all that is ever
+ * legitimate.  (The DNS cookie resend budget, COOKIE_RESEND_MAX in
+ * ares_cookie.c, is the third instance of this pattern.) */
+#define ARES_QUERY_MAX_TC_TRIES   1
+#define ARES_QUERY_MAX_EDNS_TRIES 1
+
 struct ares_query;
 typedef struct ares_query ares_query_t;
 
@@ -176,6 +197,10 @@ struct ares_query {
   /* Query status */
   size_t        try_count; /* Number of times we tried this query already. */
   size_t        cookie_try_count; /* Attempt count for cookie resends */
+  size_t        tc_try_count;     /* UDP->TCP switches after truncated (TC)
+                                   * responses; budget ARES_QUERY_MAX_TC_TRIES */
+  size_t        edns_try_count;   /* EDNS downgrades after FORMERR responses;
+                                   * budget ARES_QUERY_MAX_EDNS_TRIES */
   ares_bool_t   using_tcp;
   ares_status_t error_status;
   size_t        timeouts;   /* number of timeouts we saw for this request */

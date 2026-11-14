@@ -265,6 +265,30 @@ TEST_P(MockUDPChannelTest, TruncationRetry) {
   EXPECT_EQ("{'www.google.com' aliases=[] addrs=[1.2.3.4]}", ss.str());
 }
 
+// A hostile server that sets TC on every response -- UDP and TCP alike --
+// must not keep the query bouncing between transports or get a truncated
+// answer accepted as if it were complete: the UDP->TCP switch budget is
+// spent on the first truncated UDP response, and a truncated TCP response
+// has no further fallback (RFC 1035 4.2.2), so the query fails with an
+// observable error instead of being requeued again.
+TEST_P(MockUDPChannelTest, TruncationLoopTerminates)
+{
+  DNSPacket rsptruncated;
+  rsptruncated.set_response().set_aa().set_tc().add_question(
+    new DNSQuestion("www.google.com", T_A));
+  // Exactly two requests: the initial UDP query and one TCP retry.
+  EXPECT_CALL(server_, OnRequest("www.google.com", T_A))
+    .Times(2)
+    .WillRepeatedly(SetReply(&server_, &rsptruncated));
+  HostResult result;
+  ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback,
+                     &result);
+  Process();
+  EXPECT_TRUE(result.done_);
+  EXPECT_EQ(0, result.timeouts_);
+  EXPECT_EQ(ARES_EBADRESP, result.status_);
+}
+
 TEST_P(MockUDPChannelTest, UTF8BadName) {
   DNSPacket reply;
   reply.set_response().set_aa()
@@ -1359,6 +1383,67 @@ TEST_P(MockEDNSChannelTest, RetryWithoutEDNS) {
   std::stringstream ss;
   ss << result.host_;
   EXPECT_EQ("{'www.google.com' aliases=[] addrs=[1.2.3.4]}", ss.str());
+}
+
+// A hostile server that answers every EDNS query with FORMERR gets exactly
+// one downgrade retry: the FORMERR to the retried (now EDNS-less) query is
+// the final answer and surfaces as an observable error.  The per-query
+// downgrade budget keeps the query from being requeued forever.
+TEST_P(MockEDNSChannelTest, FormErrLoopTerminates)
+{
+  DNSPacket rspfail;
+  rspfail.set_response().set_aa().set_rcode(FORMERR).add_question(
+    new DNSQuestion("www.google.com", T_A));
+  // Exactly two requests: the initial EDNS query and one downgrade retry.
+  EXPECT_CALL(server_, OnRequest("www.google.com", T_A))
+    .Times(2)
+    .WillRepeatedly(SetReply(&server_, &rspfail));
+  HostResult result;
+  ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback,
+                     &result);
+  Process();
+  EXPECT_TRUE(result.done_);
+  EXPECT_EQ(0, result.timeouts_);
+  EXPECT_EQ(ARES_EFORMERR, result.status_);
+}
+
+// The full hostile sequence: TC on UDP forces the query to TCP, FORMERR on
+// TCP forces the EDNS downgrade, then yet another FORMERR.  Each downgrade
+// state spends its budget exactly once and the query terminates with the
+// observable FORMERR error instead of looping.  When the channel is already
+// forced to TCP, the very first truncated response has no further fallback
+// and the query fails right away with an observable error.
+TEST_P(MockEDNSChannelTest, TruncationThenFormErrLoopTerminates)
+{
+  DNSPacket rsptruncated;
+  rsptruncated.set_response().set_aa().set_tc().add_question(
+    new DNSQuestion("www.google.com", T_A));
+  DNSPacket rspfail;
+  rspfail.set_response().set_aa().set_rcode(FORMERR).add_question(
+    new DNSQuestion("www.google.com", T_A));
+  HostResult result;
+  if (GetParam().second) {
+    // Forced to TCP: TC on the one and only response, no fallback left.
+    EXPECT_CALL(server_, OnRequest("www.google.com", T_A))
+      .WillOnce(SetReply(&server_, &rsptruncated));
+    ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback,
+                       &result);
+    Process();
+    EXPECT_TRUE(result.done_);
+    EXPECT_EQ(0, result.timeouts_);
+    EXPECT_EQ(ARES_EBADRESP, result.status_);
+  } else {
+    EXPECT_CALL(server_, OnRequest("www.google.com", T_A))
+      .WillOnce(SetReply(&server_, &rsptruncated))
+      .WillOnce(SetReply(&server_, &rspfail))
+      .WillOnce(SetReply(&server_, &rspfail));
+    ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback,
+                       &result);
+    Process();
+    EXPECT_TRUE(result.done_);
+    EXPECT_EQ(0, result.timeouts_);
+    EXPECT_EQ(ARES_EFORMERR, result.status_);
+  }
 }
 
 
