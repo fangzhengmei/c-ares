@@ -208,3 +208,44 @@ size_t ares_htable_strvp_num_keys(const ares_htable_strvp_t *htable)
   }
   return ares_htable_num_keys(htable->hash);
 }
+
+char **ares_htable_strvp_keys(const ares_htable_strvp_t *htable, size_t *num)
+{
+  const void **buckets = NULL;
+  size_t       cnt     = 0;
+  char       **out     = NULL;
+  size_t       i;
+
+  if (htable == NULL || num == NULL) {
+    return NULL; /* LCOV_EXCL_LINE: DefensiveCoding */
+  }
+
+  *num = 0;
+
+  buckets = ares_htable_all_buckets(htable->hash, &cnt);
+  if (buckets == NULL || cnt == 0) {
+    return NULL;
+  }
+
+  out = ares_malloc_zero(sizeof(*out) * cnt);
+  if (out == NULL) {
+    goto fail; /* LCOV_EXCL_LINE: OutOfMemory */
+  }
+
+  for (i = 0; i < cnt; i++) {
+    out[i] = ares_strdup(((const ares_htable_strvp_bucket_t *)buckets[i])->key);
+    if (out[i] == NULL) {
+      goto fail;
+    }
+  }
+
+  ares_free(buckets);
+  *num = cnt;
+  return out;
+
+fail:
+  *num = 0;
+  ares_free(buckets);
+  ares_free_array(out, cnt, ares_free);
+  return NULL;
+}

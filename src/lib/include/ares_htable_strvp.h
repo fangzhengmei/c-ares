@@ -125,6 +125,17 @@ CARES_EXTERN void *ares_htable_strvp_claim(ares_htable_strvp_t *htable,
 CARES_EXTERN size_t
   ares_htable_strvp_num_keys(const ares_htable_strvp_t *htable);
 
+/*! Retrieve an array of keys from the hashtable.
+ *
+ *  \param[in]  htable  Initialized hashtable
+ *  \param[out] num     Count of returned keys
+ *  \return Array of keys in the hashtable. Must be free'd with
+ *          ares_free_array(keys, num, ares_free).  NULL on error or when the
+ *          table is empty.
+ */
+CARES_EXTERN char **ares_htable_strvp_keys(const ares_htable_strvp_t *htable,
+                                           size_t                    *num);
+
 /*! @} */
 
 #endif /* __ARES__HTABLE_STRVP_H */

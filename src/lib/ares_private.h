@@ -48,6 +48,7 @@
 #include "ares_array.h"
 #include "ares_llist.h"
 #include "dsa/ares_slist.h"
+#include "ares_strset.h"
 #include "ares_htable_strvp.h"
 #include "ares_htable_szvp.h"
 #include "ares_htable_asvp.h"
@@ -522,6 +523,27 @@ ares_status_t ares_append_ai_node(int aftype, unsigned short port,
                                   unsigned int ttl, const void *adata,
                                   struct ares_addrinfo_node **nodes);
 
+/*! Append an address node to a list being built head-to-tail.
+ *
+ *  ares_append_ai_node() finds the tail by walking the list, so building an
+ *  N-entry list one node at a time is O(N^2).  This variant takes the head and
+ *  the tail node returned by the previous call (both initially NULL), making
+ *  the whole build O(N).
+ *
+ *  \param[in]     aftype  AF_INET or AF_INET6
+ *  \param[in]     port    Port, host byte order
+ *  \param[in]     ttl     TTL to record
+ *  \param[in]     adata   Address bytes for the family
+ *  \param[in,out] head    List head; set when the list was empty
+ *  \param[in,out] tail    Tail node so far (NULL for an empty list); updated
+ *                         to the newly appended node on success
+ *  \return ARES_SUCCESS, ARES_ENOMEM or ARES_EFORMERR
+ */
+ares_status_t ares_append_ai_node_tail(int aftype, unsigned short port,
+                                       unsigned int ttl, const void *adata,
+                                       struct ares_addrinfo_node **head,
+                                       struct ares_addrinfo_node **tail);
+
 void ares_addrinfo_cat_cnames(struct ares_addrinfo_cname **head,
                               struct ares_addrinfo_cname  *tail);
 
@@ -580,6 +602,24 @@ ares_status_t ares_hosts_entry_to_addrinfo(const ares_hosts_entry_t *entry,
                                            unsigned short        port,
                                            ares_bool_t           want_cnames,
                                            struct ares_addrinfo *ai);
+
+/*! Report the reference count of a cached hosts entry.  For tests and
+ *  assertions only: a healthy cache holds exactly one reference in iphash for
+ *  every reverse entry, plus exactly one more in hosthash whenever a
+ *  single-address hostname shares that reverse entry.  */
+size_t ares_hosts_entry_refcnt(const ares_hosts_entry_t *entry);
+
+/*! Count of entries owned by the address (reverse) index.  Tests only. */
+size_t ares_hosts_file_num_ipentries(const ares_hosts_file_t *hf);
+
+/*! Count of entries owned by the hostname (forward) index.  Tests only. */
+size_t ares_hosts_file_num_hostentries(const ares_hosts_file_t *hf);
+
+/*! Return the cached hosts file for a channel, parsing it if needed, without
+ *  performing a lookup.  For tests and assertions only; the caller must hold
+ *  the channel lock.  Returns NULL when the channel has no usable cache.  */
+const ares_hosts_file_t *ares_hosts_file_get(ares_channel_t *channel,
+                                             ares_bool_t     use_env);
 
 /* Same as ares_query_dnsrec() except does not take a channel lock.  Use this
  * if a channel lock is already held */

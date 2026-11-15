@@ -29,6 +29,7 @@
 #include <climits>
 #include <cstdint>
 #include <stdio.h>
+#include <sstream>
 
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
@@ -1837,6 +1838,567 @@ TEST_F(LibraryTest, GetHostByNameHostsFile)
   std::stringstream ss;
   ss << result.host_;
   EXPECT_EQ("{'b' aliases=[c] addrs=[2.2.2.2]}", ss.str());
+
+  ares_destroy(channel);
+}
+
+/* ---------------------------------------------------------------------------
+ * Hosts file: reference counting across the forward and reverse indexes,
+ * de-duplication of duplicate/malformed input, reload rollback, and bounded
+ * parse cost on pathological files.
+ * -------------------------------------------------------------------------*/
+
+namespace {
+
+/* Build a hosts file line-by-line so large pathological inputs do not need a
+ * huge single string literal in the test source. */
+class HostsBuilder {
+public:
+  HostsBuilder &Addr(const std::string &ip)
+  {
+    Separate();
+    body_ << ip;
+    return *this;
+  }
+
+  HostsBuilder &Name(const std::string &name)
+  {
+    Separate();
+    body_ << name;
+    return *this;
+  }
+
+  HostsBuilder &Endl()
+  {
+    body_ << "\n";
+    need_space_ = false;
+    return *this;
+  }
+
+  std::string str() const
+  {
+    return body_.str();
+  }
+
+private:
+  /* Whitespace-separate fields without ever starting a line with a space. */
+  void Separate()
+  {
+    if (need_space_) {
+      body_ << " ";
+    }
+    need_space_ = true;
+  }
+
+  std::ostringstream body_;
+  bool               need_space_ = false;
+};
+
+/* Milliseconds of wall time spent running fn(). */
+template <typename Fn> double ElapsedMs(Fn fn)
+{
+  auto start = std::chrono::steady_clock::now();
+  fn();
+  auto end = std::chrono::steady_clock::now();
+  return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+/* Write `contents` to a fresh temp file and pin its mtime in the past.  The
+ * cache re-parses a file whose mtime is in the same second as the parse, so
+ * tests that hold a cached entry pointer across lookups need the file to be
+ * considered settled. */
+class PinnedHostsFile {
+public:
+  explicit PinnedHostsFile(const std::string &contents) : file_(contents)
+  {
+#ifndef WIN32
+    struct timeval pinned[2];
+    gettimeofday(&pinned[0], nullptr);
+    pinned[0].tv_sec -= 100;
+    pinned[1]         = pinned[0];
+    EXPECT_EQ(0, utimes(file_.filename(), pinned));
+#endif
+  }
+
+  const char *filename() const
+  {
+    return file_.filename();
+  }
+
+private:
+  TempFile file_;
+};
+
+/* Parse the hosts file named by path into a private channel's cache.  Returns
+ * the number of address (reverse) and hostname (forward) entries, or false if
+ * the cache could not be built. */
+bool HostsCacheCounts(const std::string &path, size_t *ip_entries,
+                      size_t *host_entries)
+{
+  ares_channel_t          *channel = nullptr;
+  struct ares_options      opts;
+  const ares_hosts_file_t *hf;
+
+  memset(&opts, 0, sizeof(opts));
+  opts.hosts_path = strdup(path.c_str());
+  if (ares_init_options(&channel, &opts, ARES_OPT_HOSTS_FILE) != ARES_SUCCESS) {
+    free(opts.hosts_path);
+    return false;
+  }
+  free(opts.hosts_path);
+
+  hf = ares_hosts_file_get(channel, ARES_FALSE);
+  if (hf == nullptr) {
+    ares_destroy(channel);
+    return false;
+  }
+  *ip_entries   = ares_hosts_file_num_ipentries(hf);
+  *host_entries = ares_hosts_file_num_hostentries(hf);
+
+  ares_destroy(channel);
+  return true;
+}
+
+/* Parse a hosts file built by `build` and return the elapsed milliseconds. */
+template <typename Fn> double ParseHostsMs(Fn build)
+{
+  HostsBuilder b;
+  build(b);
+  PinnedHostsFile hostsfile(b.str());
+  size_t          ip_entries = 0, host_entries = 0;
+  bool            ok = false;
+
+  double          elapsed = ElapsedMs([&]() {
+    ok = HostsCacheCounts(hostsfile.filename(), &ip_entries, &host_entries);
+  });
+  EXPECT_TRUE(ok);
+  return elapsed;
+}
+
+}  // namespace
+
+/* A single-address hostname shares one object between iphash and hosthash, so
+ * that object must hold exactly two references.  A multi-address hostname gets
+ * its own forward entry (one reference in hosthash) while each address keeps a
+ * reverse entry (one reference, plus one per single-address name sharing it).
+ */
+TEST_F(LibraryTest, HostsFileSharedEntryRefcounts)
+{
+  PinnedHostsFile           hostsfile("1.1.1.1 shared\n"
+                                      "1.1.1.1 alson\n"
+                                      "3.3.3.3 multi\n"
+                                      "4.4.4.4 multi\n");
+  ares_channel_t           *channel = nullptr;
+  struct ares_options       opts;
+  const ares_hosts_file_t  *hf;
+  const ares_hosts_entry_t *entry = nullptr;
+
+  memset(&opts, 0, sizeof(opts));
+  opts.hosts_path = strdup(hostsfile.filename());
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_init_options(&channel, &opts, ARES_OPT_HOSTS_FILE));
+  free(opts.hosts_path);
+
+  hf = ares_hosts_file_get(channel, ARES_FALSE);
+  ASSERT_NE(nullptr, hf);
+
+  /* shared and alson each point at 1.1.1.1's reverse entry: iphash owns one
+   * reference, each of the two names in hosthash adds one. */
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_hosts_search_host(channel, ARES_FALSE, "shared", &entry));
+  ASSERT_NE(nullptr, entry);
+  EXPECT_EQ((size_t)3, ares_hosts_entry_refcnt(entry));
+
+  /* Both names genuinely resolve to the same cached object. */
+  const ares_hosts_entry_t *other = nullptr;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_hosts_search_host(channel, ARES_FALSE, "alson", &other));
+  EXPECT_EQ(entry, other);
+
+  /* multi is a dedicated forward entry: one reference only. */
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_hosts_search_host(channel, ARES_FALSE, "multi", &entry));
+  ASSERT_NE(nullptr, entry);
+  EXPECT_EQ((size_t)1, ares_hosts_entry_refcnt(entry));
+
+  /* Each of multi's addresses keeps its own reverse entry with its own single
+   * reference (the shared forward entry is not counted against them). */
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_hosts_search_ipaddr(channel, ARES_FALSE, "3.3.3.3", &entry));
+  EXPECT_EQ((size_t)1, ares_hosts_entry_refcnt(entry));
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_hosts_search_ipaddr(channel, ARES_FALSE, "4.4.4.4", &entry));
+  EXPECT_EQ((size_t)1, ares_hosts_entry_refcnt(entry));
+
+  /* 1.1.1.1's reverse entry is shared by two names: iphash + two hosthash
+   * slots = three references, and they all stay live while the cache does. */
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_hosts_search_ipaddr(channel, ARES_FALSE, "1.1.1.1", &entry));
+  EXPECT_EQ((size_t)3, ares_hosts_entry_refcnt(entry));
+
+  ares_destroy(channel);
+}
+
+/* Duplicate lines and duplicate aliases must be filtered at insertion time so
+ * they neither multiply entries nor disturb the reference counts. */
+TEST_F(LibraryTest, HostsFileDuplicateInputDeduped)
+{
+  HostsBuilder b;
+  for (int i = 0; i < 200; i++) {
+    b.Addr("1.1.1.1").Name("dup").Name("dup").Endl();
+    b.Addr("1.1.1.1").Name("DUP").Endl();
+  }
+  /* A line whose alias list repeats the same names in different case. */
+  b.Addr("2.2.2.2").Name("base");
+  for (int i = 0; i < 50; i++) {
+    b.Name("alias");
+  }
+  for (int i = 0; i < 50; i++) {
+    b.Name("ALIAS");
+  }
+  b.Endl();
+
+  /* A hostname that is already multi-address appearing again on an address it
+   * already has: this duplicate edge must be a no-op, not re-recorded.
+   * dup2 becomes multi-address via 4.4.4.4 then 5.5.5.5, and hosthash still
+   * points at 4.4.4.4's reverse entry during the parse; re-adding the
+   * intermediate 5.5.5.5 is therefore the duplicate-edge case (cur != rev but
+   * the address is already in dup2's set). */
+  b.Addr("4.4.4.4").Name("dup2").Endl();
+  b.Addr("5.5.5.5").Name("dup2").Endl();
+  b.Addr("5.5.5.5").Name("dup2").Endl();
+
+  PinnedHostsFile hostsfile(b.str());
+  size_t          ip_entries = 0, host_entries = 0;
+  ASSERT_TRUE(
+    HostsCacheCounts(hostsfile.filename(), &ip_entries, &host_entries));
+
+  /* Distinct addresses: 1.1.1.1, 2.2.2.2, 4.4.4.4 and 5.5.5.5.  Distinct
+   * hostnames: dup, base, alias and dup2 -- duplicate lines/aliases and the
+   * repeated (dup2, 4.4.4.4) edge all collapse. */
+  EXPECT_EQ((size_t)4, ip_entries);
+  EXPECT_EQ((size_t)4, host_entries);
+
+  ares_channel_t           *channel = nullptr;
+  struct ares_options       opts;
+  const ares_hosts_entry_t *entry = nullptr;
+  memset(&opts, 0, sizeof(opts));
+  opts.hosts_path = strdup(hostsfile.filename());
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_init_options(&channel, &opts, ARES_OPT_HOSTS_FILE));
+  free(opts.hosts_path);
+
+  /* 2.2.2.2's reverse entry is shared by base and alias: iphash + two hosthash
+   * slots.  The 100 duplicate alias spellings on that line collapse to one. */
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_hosts_search_host(channel, ARES_FALSE, "base", &entry));
+  EXPECT_EQ((size_t)3, ares_hosts_entry_refcnt(entry));
+
+  /* alias and ALIAS are the same name: both forward lookups hit one entry. */
+  const ares_hosts_entry_t *alias_entry = nullptr;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_hosts_search_host(channel, ARES_FALSE, "ALIAS", &alias_entry));
+  EXPECT_EQ(entry, alias_entry);
+
+  ares_destroy(channel);
+}
+
+/* A malformed line part-way through the file must be skipped, the rest of the
+ * file must still parse, and the resulting cache must match the same content
+ * with the bad line removed -- i.e. the failure is contained, not fatal. */
+TEST_F(FileChannelTest, GetAddrInfoHostsMidParseFailureContained)
+{
+  TempFile hostsfile("4.4.4.4 good\n"
+                     "not-an-address bad\n"
+                     "5.5.5.5 also\n"
+                     "6.6.6.6 "
+                     "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh"
+                     "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh"
+                     "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh"
+                     "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh"
+                     "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh"
+                     "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh\n"
+                     "7.7.7.7 tail\n");
+  EnvValue with_env("CARES_HOSTS", hostsfile.filename());
+
+  for (const char *name : { "good", "also", "tail" }) {
+    struct ares_addrinfo_hints hints{};
+    AddrInfoResult             result{};
+    hints.ai_family = AF_INET;
+    hints.ai_flags  = ARES_AI_NOSORT | ARES_AI_ENVHOSTS;
+    ares_getaddrinfo(channel_, name, NULL, &hints, AddrInfoCallback, &result);
+    Process();
+    ASSERT_TRUE(result.done_) << name;
+    EXPECT_EQ(ARES_SUCCESS, result.status_) << name;
+    std::stringstream ss;
+    ss << result.ai_;
+    EXPECT_NE(std::string::npos, ss.str().find("addr=["))
+      << name << ": " << ss.str();
+  }
+
+  /* The over-long hostname itself must not be resolvable. */
+  struct ares_addrinfo_hints hints{};
+  AddrInfoResult             result{};
+  hints.ai_family = AF_INET;
+  hints.ai_flags  = ARES_AI_NOSORT | ARES_AI_ENVHOSTS;
+  std::string longname(300, 'h');
+  ares_getaddrinfo(channel_, longname.c_str(), NULL, &hints, AddrInfoCallback,
+                   &result);
+  Process();
+  ASSERT_TRUE(result.done_);
+  EXPECT_NE(ARES_SUCCESS, result.status_);
+}
+
+/* Edge cases in line parsing: a bare "#" after an address, trailing
+ * whitespace at end of line, an address with no hostname, an over-long
+ * hostname in the middle of a list, and a hostname with characters outside the
+ * hostname charset.  None of them may abort the rest of the file, and none may
+ * introduce an entry for the rejected name. */
+TEST_F(FileChannelTest, GetAddrInfoHostsMalformedLinesSkipped)
+{
+  TempFile hostsfile(
+    "1.1.1.1 keep # trailing comment\n"
+    "2.2.2.2 keep2   \n"
+    "3.3.3.3\n"
+    "4.4.4.4 good4 bad!name\n"
+    "5.5.5.5 good5 " /* over-long name in a list: skipped, rest kept */
+    "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh"
+    "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh"
+    "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh"
+    "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh"
+    "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh"
+    "\n"
+    "6.6.6.6 good6\n");
+  EnvValue                   with_env("CARES_HOSTS", hostsfile.filename());
+
+  struct ares_addrinfo_hints hints{};
+  AddrInfoResult             result{};
+  hints.ai_family = AF_INET;
+  hints.ai_flags  = ARES_AI_NOSORT | ARES_AI_ENVHOSTS;
+
+  for (const char *name : { "keep", "keep2", "good4", "good5", "good6" }) {
+    result = AddrInfoResult{};
+    ares_getaddrinfo(channel_, name, NULL, &hints, AddrInfoCallback, &result);
+    Process();
+    ASSERT_TRUE(result.done_) << name;
+    EXPECT_EQ(ARES_SUCCESS, result.status_) << name;
+  }
+
+  /* The bad hostname must not be resolvable; the address-only line adds no
+   * name. */
+  result = AddrInfoResult{};
+  ares_getaddrinfo(channel_, "bad!name", NULL, &hints, AddrInfoCallback,
+                   &result);
+  Process();
+  ASSERT_TRUE(result.done_);
+  EXPECT_NE(ARES_SUCCESS, result.status_);
+}
+
+/* A reload that fails part-way (here: an allocation failure while parsing the
+ * replacement) must leave the previously loaded cache intact instead of
+ * destroying it and handing back nothing.  When a lookup fails, the channel's
+ * cache must be the very same object that was loaded before the reload
+ * attempt, with its contents and reference counts untouched. */
+TEST_F(LibraryTest, HostsFileFailedReloadKeepsOldCache)
+{
+  const std::string old_content = "1.1.1.1 stable\n";
+  const std::string new_content = "2.2.2.2 replaced\n";
+
+  for (int ii = 1; ii <= 40; ii++) {
+    PinnedHostsFile          hostsfile(old_content);
+    ares_channel_t          *channel = nullptr;
+    struct ares_options      opts;
+    const ares_hosts_file_t *hf_before;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.hosts_path = strdup(hostsfile.filename());
+    ASSERT_EQ(ARES_SUCCESS,
+              ares_init_options(&channel, &opts, ARES_OPT_HOSTS_FILE))
+      << "ii=" << ii;
+    free(opts.hosts_path);
+
+    /* Load the old content. */
+    hf_before = ares_hosts_file_get(channel, ARES_FALSE);
+    ASSERT_NE(nullptr, hf_before) << "ii=" << ii;
+    ASSERT_EQ((size_t)1, ares_hosts_file_num_ipentries(hf_before));
+    ASSERT_EQ((size_t)1, ares_hosts_file_num_hostentries(hf_before));
+
+    /* Replace the file with different content and a different size, so the
+     * next lookup must reload. */
+    {
+      FILE *fp = fopen(hostsfile.filename(), "w");
+      ASSERT_NE(nullptr, fp) << "ii=" << ii;
+      ASSERT_EQ(new_content.size(),
+                fwrite(new_content.data(), 1, new_content.size(), fp));
+      fclose(fp);
+    }
+
+    {
+      const ares_hosts_entry_t *entry = nullptr;
+      ares_status_t             status;
+
+      ClearFails();
+      SetAllocFail(ii);
+      status = ares_hosts_search_host(channel, ARES_FALSE, "stable", &entry);
+      ClearFails();
+
+      if (status == ARES_SUCCESS) {
+        /* The reload completed: the new content must be live. */
+        EXPECT_EQ((size_t)1, ares_hosts_file_num_ipentries(channel->hf))
+          << "ii=" << ii;
+      } else {
+        /* The reload failed: the old cache must be exactly as it was. */
+        EXPECT_EQ(hf_before, channel->hf) << "ii=" << ii;
+        EXPECT_EQ((size_t)1, ares_hosts_file_num_ipentries(channel->hf))
+          << "ii=" << ii;
+        EXPECT_EQ((size_t)1, ares_hosts_file_num_hostentries(channel->hf))
+          << "ii=" << ii;
+      }
+    }
+
+    ares_destroy(channel);
+  }
+}
+
+/* Duplicated lines, many aliases on one line and many addresses on one name
+ * are all pathological but must parse in roughly linear time.  This is a
+ * regression guard for the earlier O(n^2) duplicate scans: with those, a 4x
+ * larger input took ~16x longer, so the ratio bound below fails loudly if
+ * super-linear behavior returns while remaining immune to machine speed. */
+TEST_F(LibraryTest, HostsFileLargePathologicalParseIsBounded)
+{
+  auto many_addresses = [](HostsBuilder &b, int n) {
+    for (int i = 0; i < n; i++) {
+      b.Addr("10." + std::to_string((i >> 8) & 0xff) + "." +
+             std::to_string(i & 0xff) + ".1")
+        .Name("manyaddr")
+        .Endl();
+    }
+  };
+  auto dup_lines_and_aliases = [](HostsBuilder &b, int n) {
+    /* Half the rows are exact duplicates of a single edge. */
+    for (int i = 0; i < n; i++) {
+      b.Addr("1.1.1.1").Name("dup").Endl();
+      b.Addr("1.1.1.1").Name("dup").Endl();
+    }
+    /* One very long line whose aliases repeat in different case. */
+    b.Addr("2.2.2.2").Name("line");
+    for (int i = 0; i < n; i++) {
+      b.Name("alias" + std::to_string(i % (n / 2)));
+    }
+    for (int i = 0; i < n; i++) {
+      b.Name("ALIAS" + std::to_string(i % (n / 2)));
+    }
+    b.Endl();
+  };
+
+  /* Small enough that the pre-fix quadratic code still finishes in a test run,
+   * large enough that the quadratic term dominates. */
+  const int kSmall = 4000;
+  const int kLarge = 16000; /* 4x */
+
+  for (int shape = 0; shape < 2; shape++) {
+    double small, large;
+    if (shape == 0) {
+      small = ParseHostsMs([&](HostsBuilder &b) { many_addresses(b, kSmall); });
+      large = ParseHostsMs([&](HostsBuilder &b) { many_addresses(b, kLarge); });
+    } else {
+      small = ParseHostsMs(
+        [&](HostsBuilder &b) { dup_lines_and_aliases(b, kSmall); });
+      large = ParseHostsMs(
+        [&](HostsBuilder &b) { dup_lines_and_aliases(b, kLarge); });
+    }
+
+    /* Linear behavior is ~4x; quadratic is ~16x.  Allow a very wide margin for
+     * fixed overhead and noise on tiny measurements, but stay well clear of
+     * the quadratic ratio. */
+    double ratio = large / (small > 0.001 ? small : 0.001);
+    EXPECT_LT(ratio, 10.0) << "shape " << shape << ": " << small << "ms -> "
+                           << large << "ms suggests super-linear parsing";
+  }
+
+  /* Duplicate rows/aliases collapse to a handful of entries even in the large
+   * case: this pins the de-duplication the timing test also exercises. */
+  HostsBuilder b;
+  dup_lines_and_aliases(b, kLarge);
+  PinnedHostsFile hostsfile(b.str());
+  size_t          ip_entries = 0, host_entries = 0;
+  ASSERT_TRUE(
+    HostsCacheCounts(hostsfile.filename(), &ip_entries, &host_entries));
+  /* Two addresses; dup, line and the kLarge/2 distinct aliases. */
+  EXPECT_EQ((size_t)2, ip_entries);
+  EXPECT_EQ((size_t)2 + (size_t)(kLarge / 2), host_entries);
+}
+
+/* With ARES_AI_ENVHOSTS but no CARES_HOSTS in the environment, resolution must
+ * fall back to the platform default hosts file instead of failing with
+ * ARES_ENOMEM.  ares_getaddrinfo() ignores most hosts-file errors for
+ * localhost, but not ENOMEM, so conflating "unset" with "out of memory" used
+ * to break localhost resolution entirely. */
+TEST_F(FileChannelTest, GetAddrInfoHostsEnvUnsetFallsBack)
+{
+  char       *saved       = getenv("CARES_HOSTS");
+  std::string saved_value = saved ? saved : "";
+  unsetenv("CARES_HOSTS");
+
+  struct ares_addrinfo_hints hints{};
+  AddrInfoResult             result{};
+  hints.ai_family = AF_INET;
+  hints.ai_flags  = ARES_AI_NOSORT | ARES_AI_ENVHOSTS;
+  ares_getaddrinfo(channel_, "localhost", NULL, &hints, AddrInfoCallback,
+                   &result);
+  Process();
+  ASSERT_TRUE(result.done_);
+
+  /* localhost always resolves (RFC 6761 6.3 #3), so the only failure mode we
+   * are guarding against is ENOMEM leaking out of the hosts lookup. */
+  EXPECT_NE(ARES_ENOMEM, result.status_);
+  std::stringstream ss;
+  ss << result.ai_;
+  EXPECT_NE(std::string::npos, ss.str().find("127.0.0.1")) << ss.str();
+
+  if (saved != nullptr) {
+    setenv("CARES_HOSTS", saved_value.c_str(), 1);
+  }
+}
+
+/* Error paths of the cached lookup helpers: an unparseable address is
+ * rejected before the index is consulted, and a channel whose hosts file path
+ * cannot be read reports the failure from the search (and the test-only
+ * accessor) rather than returning a stale entry. */
+TEST_F(LibraryTest, HostsFileSearchErrorPaths)
+{
+  PinnedHostsFile           hostsfile("1.1.1.1 host\n");
+  ares_channel_t           *channel = nullptr;
+  struct ares_options       opts;
+  const ares_hosts_entry_t *entry = nullptr;
+
+  memset(&opts, 0, sizeof(opts));
+  opts.hosts_path = strdup(hostsfile.filename());
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_init_options(&channel, &opts, ARES_OPT_HOSTS_FILE));
+  free(opts.hosts_path);
+
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_hosts_search_host(channel, ARES_FALSE, "host", &entry));
+  ASSERT_NE(nullptr, entry);
+
+  /* Not an address: the reverse lookup rejects it. */
+  EXPECT_EQ(ARES_EBADNAME, ares_hosts_search_ipaddr(channel, ARES_FALSE,
+                                                    "not-an-address", &entry));
+
+  /* Point at a path that does not exist, so any reload attempt fails. */
+  ares_free(channel->hosts_path);
+  {
+    std::string missing = std::string(hostsfile.filename()) + ".missing";
+    channel->hosts_path = ares_strdup(missing.c_str());
+  }
+  ASSERT_NE(nullptr, channel->hosts_path);
+  EXPECT_NE(ARES_SUCCESS,
+            ares_hosts_search_host(channel, ARES_FALSE, "host", &entry));
+  EXPECT_NE(ARES_SUCCESS,
+            ares_hosts_search_ipaddr(channel, ARES_FALSE, "1.1.1.1", &entry));
+  EXPECT_EQ(nullptr, ares_hosts_file_get(channel, ARES_FALSE));
 
   ares_destroy(channel);
 }
@@ -3959,6 +4521,144 @@ TEST_F(LibraryTest, EbcdicSearchListAllBlanks) {
   parts = ares_strsplit(ascii, ", ", &n);
   EXPECT_EQ(nullptr, parts);
   EXPECT_EQ((size_t)0, n);
+}
+#endif /* !CARES_SYMBOL_HIDING */
+
+/* ---------------------------------------------------------------------------
+ * ares_strset: ordered, case-insensitive de-duplicating string set
+ * -------------------------------------------------------------------------*/
+
+TEST_F(LibraryTest, StrsetEmpty)
+{
+  ares_strset_t *set = ares_strset_create();
+  ASSERT_NE(nullptr, set);
+
+  EXPECT_EQ((size_t)0, ares_strset_len(set));
+  EXPECT_EQ(nullptr, ares_strset_first(set));
+  EXPECT_EQ(nullptr, ares_strset_node_first(set));
+  EXPECT_FALSE(ares_strset_contains(set, "anything"));
+  ares_strset_destroy(set);
+}
+
+TEST_F(LibraryTest, StrsetInsertPreservesOrderAndDedups)
+{
+  ares_strset_t      *set = ares_strset_create();
+  ares_strset_node_t *node;
+  const char         *seen[8];
+  size_t              cnt = 0;
+
+  ASSERT_NE(nullptr, set);
+
+  /* Insert a duplicate and a differently-cased duplicate interleaved with new
+   * values: insertion order must be first-seen order and each value must
+   * appear exactly once. */
+  EXPECT_TRUE(ares_strset_insert(set, "alpha"));
+  EXPECT_TRUE(ares_strset_insert(set, "bravo"));
+  EXPECT_TRUE(ares_strset_insert(set, "ALPHA"));
+  EXPECT_TRUE(ares_strset_insert(set, "charlie"));
+  EXPECT_TRUE(ares_strset_insert(set, "Bravo"));
+
+  EXPECT_EQ((size_t)3, ares_strset_len(set));
+
+  for (node = ares_strset_node_first(set); node != nullptr;
+       node = ares_strset_node_next(node)) {
+    ASSERT_LT(cnt, 8U);
+    seen[cnt++] = ares_strset_node_val(node);
+  }
+  ASSERT_EQ((size_t)3, cnt);
+  EXPECT_STREQ("alpha", seen[0]);
+  EXPECT_STREQ("bravo", seen[1]);
+  EXPECT_STREQ("charlie", seen[2]);
+
+  /* The stored copy of a duplicate is the first insertion. */
+  EXPECT_STREQ("alpha", ares_strset_insert_get(set, "AlPhA"));
+  EXPECT_EQ((size_t)3, ares_strset_len(set));
+
+  EXPECT_TRUE(ares_strset_contains(set, "CHARLIE"));
+  EXPECT_FALSE(ares_strset_contains(set, "delta"));
+
+  ares_strset_destroy(set);
+}
+
+TEST_F(LibraryTest, StrsetNullArgs)
+{
+  ares_strset_t *set = ares_strset_create();
+  ASSERT_NE(nullptr, set);
+
+  EXPECT_FALSE(ares_strset_insert(nullptr, "x"));
+  EXPECT_FALSE(ares_strset_insert(set, nullptr));
+  EXPECT_FALSE(ares_strset_contains(nullptr, "x"));
+  EXPECT_FALSE(ares_strset_contains(set, nullptr));
+  EXPECT_EQ(nullptr, ares_strset_insert_get(set, nullptr));
+  EXPECT_EQ(nullptr, ares_strset_node_val(nullptr));
+  EXPECT_EQ(nullptr, ares_strset_node_next(nullptr));
+  EXPECT_EQ((size_t)0, ares_strset_len(nullptr));
+  EXPECT_EQ(nullptr, ares_strset_first(nullptr));
+  ares_strset_destroy(nullptr);
+
+  ares_strset_destroy(set);
+}
+
+TEST_F(LibraryTest, StrsetAllocFail)
+{
+  /* Every allocation the set makes must be able to fail without leaking or
+   * leaving a partially inserted value visible. */
+  for (int ii = 1; ii <= 6; ii++) {
+    ares_strset_t *set = nullptr;
+
+    ClearFails();
+    SetAllocFail(ii);
+    set = ares_strset_create();
+    if (set == nullptr) {
+      ClearFails();
+      continue;
+    }
+
+    if (ares_strset_insert(set, "first")) {
+      EXPECT_EQ((size_t)1, ares_strset_len(set));
+      EXPECT_TRUE(ares_strset_contains(set, "first"));
+      EXPECT_STREQ("first", ares_strset_first(set));
+    } else {
+      /* A failed insert must not leave a half-registered value behind. */
+      EXPECT_EQ((size_t)0, ares_strset_len(set));
+      EXPECT_FALSE(ares_strset_contains(set, "first"));
+    }
+    ClearFails();
+    ares_strset_destroy(set);
+  }
+}
+
+#ifndef CARES_SYMBOL_HIDING
+TEST_F(LibraryTest, HtableStrvpKeys)
+{
+  ares_htable_strvp_t *ht    = ares_htable_strvp_create(ares_free);
+  char               **keys  = nullptr;
+  size_t               num   = 0;
+  ares_bool_t          saw_a = ARES_FALSE, saw_b = ARES_FALSE;
+  size_t               i;
+
+  ASSERT_NE(nullptr, ht);
+  EXPECT_EQ(nullptr, ares_htable_strvp_keys(ht, &num));
+  EXPECT_EQ((size_t)0, num);
+
+  ASSERT_TRUE(ares_htable_strvp_insert(ht, "alpha", ares_strdup("1")));
+  ASSERT_TRUE(ares_htable_strvp_insert(ht, "beta", ares_strdup("2")));
+
+  keys = ares_htable_strvp_keys(ht, &num);
+  ASSERT_NE(nullptr, keys);
+  EXPECT_EQ((size_t)2, num);
+  for (i = 0; i < num; i++) {
+    if (strcmp(keys[i], "alpha") == 0) {
+      saw_a = ARES_TRUE;
+    } else if (strcmp(keys[i], "beta") == 0) {
+      saw_b = ARES_TRUE;
+    }
+  }
+  EXPECT_TRUE(saw_a);
+  EXPECT_TRUE(saw_b);
+  ares_free_array(keys, num, ares_free);
+
+  ares_htable_strvp_destroy(ht);
 }
 #endif /* !CARES_SYMBOL_HIDING */
 

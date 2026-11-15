@@ -54,6 +54,7 @@ CSOURCES = ares_addrinfo2hostent.c	\
   dsa/ares_htable_vpvp.c		\
   dsa/ares_llist.c			\
   dsa/ares_slist.c			\
+  dsa/ares_strset.c			\
   event/ares_event_configchg.c		\
   event/ares_event_epoll.c		\
   event/ares_event_kqueue.c		\
@@ -121,6 +122,7 @@ HHEADERS = ares_android.h			\
   include/ares_mem.h			\
   include/ares_punycode.h		\
   include/ares_str.h			\
+  include/ares_strset.h			\
   record/ares_dns_multistring.h		\
   record/ares_dns_private.h		\
   str/ares_idnamap.h			\

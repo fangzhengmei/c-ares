@@ -63,9 +63,11 @@ static ares_bool_t ares_ai_has_family(int                              aftype,
   return ARES_FALSE;
 }
 
-ares_status_t ares_append_ai_node(int aftype, unsigned short port,
-                                  unsigned int ttl, const void *adata,
-                                  struct ares_addrinfo_node **nodes)
+/* Allocate and fill an addrinfo node for one address, without linking it. */
+static struct ares_addrinfo_node *ares_ai_node_create(int            aftype,
+                                                      unsigned short port,
+                                                      unsigned int   ttl,
+                                                      const void    *adata)
 {
   struct ares_addrinfo_node *node;
   struct sockaddr           *sa;
@@ -74,7 +76,7 @@ ares_status_t ares_append_ai_node(int aftype, unsigned short port,
   if (aftype == AF_INET) {
     struct sockaddr_in *sin = ares_malloc(sizeof(*sin));
     if (!sin) {
-      return ARES_ENOMEM; /* LCOV_EXCL_LINE: OutOfMemory */
+      return NULL; /* LCOV_EXCL_LINE: OutOfMemory */
     }
 
     memset(sin, 0, sizeof(*sin));
@@ -87,7 +89,7 @@ ares_status_t ares_append_ai_node(int aftype, unsigned short port,
   } else if (aftype == AF_INET6) {
     struct sockaddr_in6 *sin6 = ares_malloc(sizeof(*sin6));
     if (!sin6) {
-      return ARES_ENOMEM; /* LCOV_EXCL_LINE: OutOfMemory */
+      return NULL; /* LCOV_EXCL_LINE: OutOfMemory */
     }
 
     memset(sin6, 0, sizeof(*sin6));
@@ -98,19 +100,83 @@ ares_status_t ares_append_ai_node(int aftype, unsigned short port,
     sa    = (struct sockaddr *)sin6;
     salen = sizeof(*sin6);
   } else {
-    return ARES_EFORMERR;
+    return NULL; /* LCOV_EXCL_LINE: DefensiveCoding */
   }
 
-  node = ares_append_addrinfo_node(nodes);
-  if (!node) {
-    ares_free(sa);      /* LCOV_EXCL_LINE: OutOfMemory */
-    return ARES_ENOMEM; /* LCOV_EXCL_LINE: OutOfMemory */
+  node = ares_malloc_zero(sizeof(*node));
+  if (node == NULL) {
+    ares_free(sa); /* LCOV_EXCL_LINE: OutOfMemory */
+    return NULL;   /* LCOV_EXCL_LINE: OutOfMemory */
   }
 
   node->ai_addr    = sa;
   node->ai_family  = aftype;
   node->ai_addrlen = salen;
   node->ai_ttl     = ares_dns_ttl_as_int(ttl);
+
+  return node;
+}
+
+ares_status_t ares_append_ai_node(int aftype, unsigned short port,
+                                  unsigned int ttl, const void *adata,
+                                  struct ares_addrinfo_node **nodes)
+{
+  struct ares_addrinfo_node *node;
+  struct ares_addrinfo_node *last;
+
+  if (aftype != AF_INET && aftype != AF_INET6) {
+    return ARES_EFORMERR;
+  }
+
+  node = ares_ai_node_create(aftype, port, ttl, adata);
+  if (node == NULL) {
+    return ARES_ENOMEM; /* LCOV_EXCL_LINE: OutOfMemory */
+  }
+
+  if (*nodes == NULL) {
+    *nodes = node;
+    return ARES_SUCCESS;
+  }
+
+  last = *nodes;
+  while (last->ai_next != NULL) {
+    last = last->ai_next;
+  }
+  last->ai_next = node;
+
+  return ARES_SUCCESS;
+}
+
+ares_status_t ares_append_ai_node_tail(int aftype, unsigned short port,
+                                       unsigned int ttl, const void *adata,
+                                       struct ares_addrinfo_node **head,
+                                       struct ares_addrinfo_node **tail)
+{
+  struct ares_addrinfo_node *node;
+
+  if (head == NULL || tail == NULL) {
+    return ARES_EFORMERR; /* LCOV_EXCL_LINE: DefensiveCoding */
+  }
+
+  if (*head == NULL && *tail != NULL) {
+    return ARES_EFORMERR; /* LCOV_EXCL_LINE: DefensiveCoding */
+  }
+
+  if (aftype != AF_INET && aftype != AF_INET6) {
+    return ARES_EFORMERR;
+  }
+
+  node = ares_ai_node_create(aftype, port, ttl, adata);
+  if (node == NULL) {
+    return ARES_ENOMEM; /* LCOV_EXCL_LINE: OutOfMemory */
+  }
+
+  if (*tail != NULL) {
+    (*tail)->ai_next = node;
+  } else {
+    *head = node;
+  }
+  *tail = node;
 
   return ARES_SUCCESS;
 }
