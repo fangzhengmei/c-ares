@@ -1723,6 +1723,390 @@ TEST_P(MockChannelTest, SearchHighNdots) {
             ss.str());
 }
 
+/* Fixture for the hostile-search-configuration tests.  Those build their own
+ * search list per test, so each creates a second channel pointed at the
+ * fixture's mock server instead of using the one MockChannelOptsTest builds
+ * from the three default domains. */
+class MockSearchDomainsTest
+  : public MockChannelOptsTest,
+    public ::testing::WithParamInterface<std::pair<int, bool>> {
+public:
+  MockSearchDomainsTest()
+    : MockChannelOptsTest(1, GetParam().first, GetParam().second, false,
+                          nullptr, 0)
+  {
+  }
+
+  // Build a channel with the given search list, configured like the
+  // fixture's own channel (family, transport, timeouts, options) and pointing
+  // at the same mock server.  The caller destroys it.
+  ares_channel_t *CreateSearchChannel(char **domains, int ndomains, int ndots)
+  {
+    ares_channel_t            *channel = nullptr;
+    struct ares_options        opts;
+    struct ares_addr_port_node node;
+    int                        optmask = 0;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.timeout         = 250;
+    optmask             |= ARES_OPT_TIMEOUTMS;
+    opts.tries           = 3;
+    optmask             |= ARES_OPT_TRIES;
+    opts.ndots           = ndots;
+    optmask             |= ARES_OPT_NDOTS;
+    opts.domains         = domains;
+    opts.ndomains        = ndomains;
+    optmask             |= ARES_OPT_DOMAINS;
+    opts.qcache_max_ttl  = 0;
+    optmask             |= ARES_OPT_QUERY_CACHE;
+    opts.flags           = ARES_FLAG_EDNS;
+    if (GetParam().second) {
+      opts.flags |= ARES_FLAG_USEVC;
+    }
+    optmask |= ARES_OPT_FLAGS;
+
+    EXPECT_EQ(ARES_SUCCESS, ares_init_options(&channel, &opts, optmask));
+    EXPECT_NE(nullptr, channel);
+    if (channel == nullptr) {
+      return nullptr;
+    }
+
+    memset(&node, 0, sizeof(node));
+    node.family = GetParam().first;
+    if (node.family == AF_INET) {
+      node.addr.addr4.s_addr = htonl(0x7F000001);
+    } else {
+      node.addr.addr6._S6_un._S6_u8[15] = 1;
+    }
+    node.udp_port = servers_[0]->udpport();
+    node.tcp_port = servers_[0]->tcpport();
+    EXPECT_EQ(ARES_SUCCESS, ares_set_servers_ports(channel, &node));
+    return channel;
+  }
+
+  typedef std::map<std::string, std::unique_ptr<DNSPacket>> ReplyMap;
+
+  // Record the question and answer it from the scripted map.  A name with no
+  // scripted reply is deliberately left unanswered: a test expecting a
+  // bounded query set then fails on the recorded list and timeout count
+  // rather than silently accepting an unexpected query.
+  void RecordAndReply(ReplyMap *replies, std::vector<std::string> *seen,
+                      const std::string &name)
+  {
+    ReplyMap::iterator it;
+
+    seen->push_back(name);
+    it = replies->find(name);
+    if (it == replies->end()) {
+      server_.SetReply(nullptr);
+      return;
+    }
+    server_.SetReply(it->second.get());
+  }
+
+  // Install a catch-all handler feeding every request through
+  // RecordAndReply().
+  void CaptureAllQueries(ReplyMap *replies, std::vector<std::string> *seen)
+  {
+    ON_CALL(server_, OnRequest(testing::_, T_A))
+      .WillByDefault(
+        testing::Invoke([this, replies, seen](const std::string &name, int) {
+          RecordAndReply(replies, seen, name);
+        }));
+  }
+};
+
+// A 255-octet search domain: four 63-octet labels, the RFC 1035 3.1 maximum
+// presentation length.  "www." + this exceeds the limit, so no query carrying
+// it can be sent.
+static std::string MaxLengthSearchDomain()
+{
+  std::string label(63, 'a');
+  return label + "." + label + "." + label + "." + label;
+}
+
+// A search domain long enough that "www." + domain is still a legal name
+// (244 octets) but is close to the limit.
+static std::string NearMaxLengthSearchDomain(char fill)
+{
+  std::string label(63, fill);
+  std::string tail(48, fill);
+  return label + "." + label + "." + label + "." + tail;
+}
+
+// A hostile search configuration -- a long list of near-maximal suffixes and
+// an ndots far beyond any real name's label count -- must still issue exactly
+// one query per candidate (one per search domain, plus the name as-is once),
+// in configuration order, and every query must be a legal name.  Each
+// candidate gets one NXDOMAIN, so the search runs to the end with no
+// retries.
+TEST_P(MockSearchDomainsTest, HostileSearchConfigQueryCountBounded)
+{
+  const size_t             kDomains = 16;
+  std::vector<std::string> domain_strings;
+  std::vector<char *>      domains;
+  std::vector<std::string> expected;
+  ReplyMap                 replies;
+  std::vector<std::string> seen;
+  ares_channel_t          *channel;
+  size_t                   i;
+  SearchResult             result;
+
+  // Distinct suffixes, so the recorded order proves the search walked the
+  // configured list in order rather than re-querying one domain.
+  for (i = 0; i < kDomains; i++) {
+    std::string suffix = NearMaxLengthSearchDomain((char)('a' + i));
+    domain_strings.push_back(suffix);
+    expected.push_back("www." + suffix);
+  }
+  for (i = 0; i < kDomains; i++) {
+    domains.push_back((char *)domain_strings[i].c_str());
+  }
+  // ndots exceeds the label count of "www", so the as-is name is tried last,
+  // after every domain.
+  expected.push_back("www");
+
+  for (i = 0; i < expected.size(); i++) {
+    std::unique_ptr<DNSPacket> reply(new DNSPacket);
+    reply->set_response().set_aa().set_rcode(NXDOMAIN).add_question(
+      new DNSQuestion(expected[i], T_A));
+    replies[expected[i]] = std::move(reply);
+  }
+
+  channel = CreateSearchChannel(&domains[0], (int)domains.size(), 1000000);
+  ASSERT_NE(nullptr, channel);
+
+  CaptureAllQueries(&replies, &seen);
+
+  ares_search(channel, "www", C_IN, T_A, SearchCallback, &result);
+  ProcessAltChannel(channel);
+  ares_destroy(channel);
+
+  EXPECT_TRUE(result.done_);
+  EXPECT_EQ(ARES_ENOTFOUND, result.status_);
+  EXPECT_EQ(0, result.timeouts_);
+
+  // Exactly one query per candidate, in configuration order, as-is last.
+  EXPECT_EQ(expected, seen);
+  for (i = 0; i < seen.size(); i++) {
+    EXPECT_LE(seen[i].length(), (size_t)255) << "candidate " << i;
+  }
+}
+
+// A suffix that pushes the appended name past 255 octets cannot be encoded on
+// the wire.  The lookup must fail with a clear error instead of looping, and
+// the server must never see the oversized candidate.
+TEST_P(MockSearchDomainsTest, OversizedCandidateRejectedNotSent)
+{
+  std::string                suffix = MaxLengthSearchDomain();
+  char                      *domains[1];
+  ReplyMap                   replies;
+  std::vector<std::string>   seen;
+  ares_channel_t            *channel;
+  SearchResult               result;
+  std::unique_ptr<DNSPacket> reply;
+
+  ASSERT_EQ((size_t)255, suffix.length());
+  domains[0] = (char *)suffix.c_str();
+
+  // ndots=1 with the single-label "www": the as-is name comes last, so the
+  // oversized "www.<suffix>" candidate is attempted first.
+  channel = CreateSearchChannel(domains, 1, 1);
+  ASSERT_NE(nullptr, channel);
+
+  reply.reset(new DNSPacket);
+  reply->set_response().set_aa().set_rcode(NXDOMAIN).add_question(
+    new DNSQuestion("www", T_A));
+  replies["www"] = std::move(reply);
+
+  CaptureAllQueries(&replies, &seen);
+
+  ares_search(channel, "www", C_IN, T_A, SearchCallback, &result);
+  ProcessAltChannel(channel);
+  ares_destroy(channel);
+
+  EXPECT_TRUE(result.done_);
+  // The oversized candidate is rejected before it reaches the wire, which
+  // ends the search with an explicit error.
+  EXPECT_EQ(ARES_EBADNAME, result.status_);
+  EXPECT_TRUE(seen.empty()) << "server saw " << seen.size() << " queries";
+}
+
+#ifndef WIN32
+// A HOSTALIASES hit replaces the search list entirely: exactly one query, for
+// the alias target, no matter what the search configuration says.
+TEST_P(MockSearchDomainsTest, HostAliasHitIssuesSingleQuery)
+{
+  std::string                suffix = NearMaxLengthSearchDomain('a');
+  std::vector<std::string>   domain_strings(4, suffix);
+  std::vector<char *>        domains;
+  ReplyMap                   replies;
+  std::vector<std::string>   seen;
+  ares_channel_t            *channel;
+  SearchResult               result;
+  size_t                     i;
+  std::unique_ptr<DNSPacket> reply;
+  TempFile                   aliases("www alias.example.com\n");
+  EnvValue                   with_env("HOSTALIASES", aliases.filename());
+
+  for (i = 0; i < domain_strings.size(); i++) {
+    domains.push_back((char *)domain_strings[i].c_str());
+  }
+
+  channel = CreateSearchChannel(&domains[0], (int)domains.size(), 1000000);
+  ASSERT_NE(nullptr, channel);
+
+  reply.reset(new DNSPacket);
+  reply->set_response()
+    .set_aa()
+    .add_question(new DNSQuestion("alias.example.com", T_A))
+    .add_answer(new DNSARR("alias.example.com", 100, { 7, 7, 7, 7 }));
+  replies["alias.example.com"] = std::move(reply);
+
+  CaptureAllQueries(&replies, &seen);
+
+  ares_search(channel, "www", C_IN, T_A, SearchCallback, &result);
+  ProcessAltChannel(channel);
+  ares_destroy(channel);
+
+  EXPECT_TRUE(result.done_);
+  EXPECT_EQ(ARES_SUCCESS, result.status_);
+  EXPECT_EQ(0, result.timeouts_);
+  ASSERT_EQ((size_t)1, seen.size());
+  EXPECT_EQ("alias.example.com", seen[0]);
+}
+#endif
+
+// Retries are unaffected by search-list size: a candidate that gets no reply
+// consumes one retry and is re-sent once, then the search moves on to the next
+// candidate.
+TEST_P(MockSearchDomainsTest, SearchRetriesAcrossDomains)
+{
+  std::string                suffix  = NearMaxLengthSearchDomain('a');
+  std::string                suffix2 = NearMaxLengthSearchDomain('b');
+  std::string                domain_strings[2];
+  char                      *domains[2];
+  std::vector<byte>          nothing;
+  std::unique_ptr<DNSPacket> nxfirst;
+  std::unique_ptr<DNSPacket> yessecond;
+  ares_channel_t            *channel;
+  SearchResult               result;
+
+  domain_strings[0] = suffix;
+  domain_strings[1] = suffix2;
+  domains[0]        = (char *)domain_strings[0].c_str();
+  domains[1]        = (char *)domain_strings[1].c_str();
+
+  channel = CreateSearchChannel(domains, 2, 1000000);
+  ASSERT_NE(nullptr, channel);
+
+  // First domain: no answer at all on the first attempt, NXDOMAIN on the
+  // retry.  Second domain: answered.
+  nxfirst.reset(new DNSPacket);
+  nxfirst->set_response().set_aa().set_rcode(NXDOMAIN).add_question(
+    new DNSQuestion("www." + suffix, T_A));
+  yessecond.reset(new DNSPacket);
+  yessecond->set_response()
+    .set_aa()
+    .add_question(new DNSQuestion("www." + suffix2, T_A))
+    .add_answer(new DNSARR("www." + suffix2, 100, { 8, 8, 8, 8 }));
+
+  {
+    ::testing::InSequence seq;
+    EXPECT_CALL(server_, OnRequest("www." + suffix, T_A))
+      .Times(2)
+      .WillOnce(SetReplyData(&server_, nothing))
+      .WillOnce(SetReply(&server_, nxfirst.get()));
+    EXPECT_CALL(server_, OnRequest("www." + suffix2, T_A))
+      .Times(1)
+      .WillOnce(SetReply(&server_, yessecond.get()));
+  }
+
+  ares_search(channel, "www", C_IN, T_A, SearchCallback, &result);
+  ProcessAltChannel(channel);
+  ares_destroy(channel);
+
+  EXPECT_TRUE(result.done_);
+  EXPECT_EQ(ARES_SUCCESS, result.status_);
+  // One timeout on the first domain, then the retry and the second domain.
+  EXPECT_EQ(1, result.timeouts_);
+}
+
+// A name ending in '.' is looked up as-is exactly once; the configured search
+// domains must never be appended to it.
+TEST_P(MockChannelTest, SearchAbsoluteNameBypassesDomains)
+{
+  // The trailing dot is not part of the parsed wire name, so the mock
+  // question (matched case-insensitively against the request) omits it.
+  DNSPacket reply;
+  reply.set_response()
+    .set_aa()
+    .add_question(new DNSQuestion("www.example.com", T_A))
+    .add_answer(new DNSARR("www.example.com", 0x0200, { 2, 3, 4, 5 }));
+  EXPECT_CALL(server_, OnRequest("www.example.com", T_A))
+    .Times(1)
+    .WillOnce(SetReply(&server_, &reply));
+
+  HostResult result;
+  ares_gethostbyname(channel_, "www.example.com.", AF_INET, HostCallback,
+                     &result);
+  Process();
+  EXPECT_TRUE(result.done_);
+  EXPECT_EQ(ARES_SUCCESS, result.status_);
+  EXPECT_EQ(0, result.timeouts_);
+  std::stringstream ss;
+  ss << result.host_;
+  EXPECT_EQ("{'www.example.com' aliases=[] addrs=[2.3.4.5]}", ss.str());
+}
+
+// Ordering: with ndots greater than the label count, the name as-is is tried
+// after every search domain, and each domain is tried exactly once, in
+// configuration order.
+TEST_P(MockChannelTest, SearchOrderDomainsThenAsIs)
+{
+  const char *names[4] = { "www.first.com", "www.second.org", "www.third.gov",
+                           "www" };
+
+  DNSPacket   nofirst;
+  nofirst.set_response().set_aa().add_question(new DNSQuestion(names[0], T_A));
+  DNSPacket nosecond;
+  nosecond.set_response().set_aa().add_question(new DNSQuestion(names[1], T_A));
+  DNSPacket nothird;
+  nothird.set_response().set_aa().add_question(new DNSQuestion(names[2], T_A));
+  DNSPacket yesbare;
+  yesbare.set_response()
+    .set_aa()
+    .add_question(new DNSQuestion(names[3], T_A))
+    .add_answer(new DNSARR(names[3], 0x0200, { 9, 9, 9, 9 }));
+
+  {
+    ::testing::InSequence seq;
+    EXPECT_CALL(server_, OnRequest(names[0], T_A))
+      .Times(1)
+      .WillOnce(SetReply(&server_, &nofirst));
+    EXPECT_CALL(server_, OnRequest(names[1], T_A))
+      .Times(1)
+      .WillOnce(SetReply(&server_, &nosecond));
+    EXPECT_CALL(server_, OnRequest(names[2], T_A))
+      .Times(1)
+      .WillOnce(SetReply(&server_, &nothird));
+    EXPECT_CALL(server_, OnRequest(names[3], T_A))
+      .Times(1)
+      .WillOnce(SetReply(&server_, &yesbare));
+  }
+
+  SearchResult result;
+  ares_search(channel_, "www", C_IN, T_A, SearchCallback, &result);
+  Process();
+  EXPECT_TRUE(result.done_);
+  EXPECT_EQ(ARES_SUCCESS, result.status_);
+  EXPECT_EQ(0, result.timeouts_);
+  std::stringstream ss;
+  ss << PacketToString(result.data_);
+  EXPECT_EQ("RSP QRY AA NOERROR Q:{'www' IN A} A:{'www' IN A TTL=512 9.9.9.9}",
+            ss.str());
+}
+
 // Test that performing an EDNS search with an OPT RR options value works. The
 // options value should be included on the requests to the mock server.
 // We are going to do this only via TCP since this won't include the dynamically
@@ -5796,6 +6180,10 @@ std::string PrintFamily(const testing::TestParamInfo<int> &info)
 INSTANTIATE_TEST_SUITE_P(AddressFamilies, NoDNS0x20MockTest, ::testing::ValuesIn(ares::test::families), PrintFamily);
 
 INSTANTIATE_TEST_SUITE_P(AddressFamilies, MockChannelTest, ::testing::ValuesIn(ares::test::families_modes), PrintFamilyMode);
+
+INSTANTIATE_TEST_SUITE_P(AddressFamilies, MockSearchDomainsTest,
+                         ::testing::ValuesIn(ares::test::families_modes),
+                         PrintFamilyMode);
 
 #ifdef HAVE_CONTAINER
 INSTANTIATE_TEST_SUITE_P(AddressFamilies, ContainedMockChannelSysConfig, ::testing::ValuesIn(ares::test::families_modes), PrintFamilyMode);

@@ -343,6 +343,152 @@ TEST_F(LibraryTest, CatDomain) {
   ares_free(s);
 }
 
+/* A search domain in its longest legal presentation form: four 63-octet
+ * labels, 255 octets in total (RFC 1035 3.1).  Appending any name to it
+ * exceeds the limit, so the resulting candidate cannot be put on the wire. */
+static std::string SearchMaxSuffix()
+{
+  std::string label(63, 'a');
+  return label + "." + label + "." + label + "." + label;
+}
+
+/* Wraps ares_search_name_list() in a channel built from the given search
+ * configuration, returning the expanded candidate list. */
+static ares_status_t SearchNameList(const char *name, char **domains,
+                                    int ndomains, int ndots, char ***names,
+                                    size_t *names_len)
+{
+  ares_channel_t     *channel = NULL;
+  struct ares_options opts;
+  int                 optmask;
+  int                 rc;
+
+  memset(&opts, 0, sizeof(opts));
+  opts.domains  = domains;
+  opts.ndomains = ndomains;
+  opts.ndots    = ndots;
+  opts.lookups  = (char *)"b";
+  optmask       = ARES_OPT_DOMAINS | ARES_OPT_NDOTS | ARES_OPT_LOOKUPS;
+  rc            = ares_init_options(&channel, &opts, optmask);
+  if (rc != ARES_SUCCESS) {
+    return (ares_status_t)rc;
+  }
+
+  *names_len = 0;
+  *names     = NULL;
+  rc         = (int)ares_search_name_list(channel, name, names, names_len);
+  ares_destroy(channel);
+  return (ares_status_t)rc;
+}
+
+/* A hostile search configuration -- a long list of maximal-length suffixes
+ * plus a huge ndots -- must still produce exactly one candidate per configured
+ * domain plus the name as-is, never more. */
+TEST_F(LibraryTest, SearchNameListBounded)
+{
+  std::string         suffix = SearchMaxSuffix();
+  std::vector<char *> domains(24, (char *)suffix.c_str());
+  char              **names     = NULL;
+  size_t              names_len = 0;
+  ares_status_t       status;
+  size_t              i;
+
+  ASSERT_EQ((size_t)255, suffix.length());
+
+  status = SearchNameList("www", &domains[0], (int)domains.size(), 1000000,
+                          &names, &names_len);
+  ASSERT_EQ(ARES_SUCCESS, status);
+
+  /* One suffix per configured domain, plus the name itself. */
+  ASSERT_EQ(domains.size() + 1, names_len);
+  for (i = 0; i < names_len; i++) {
+    ASSERT_NE(nullptr, names[i]);
+    /* "www" + "." + 255-octet suffix: long, but bounded by construction. */
+    EXPECT_LE(strlen(names[i]), strlen("www") + 1 + suffix.length());
+  }
+
+  /* ndots is greater than the label count of "www", so the as-is name is
+   * tried last, exactly once. */
+  EXPECT_STREQ("www", names[names_len - 1]);
+  for (i = 0; i + 1 < names_len; i++) {
+    EXPECT_EQ(0, strncmp("www.", names[i], strlen("www") + 1));
+  }
+
+  ares_strsplit_free(names, names_len);
+
+  /* ndots is only an ordering hint: a small value moves the as-is name to the
+   * front but does not change the bound. */
+  status = SearchNameList("www", &domains[0], (int)domains.size(), 0, &names,
+                          &names_len);
+  ASSERT_EQ(ARES_SUCCESS, status);
+  ASSERT_EQ(domains.size() + 1, names_len);
+  EXPECT_STREQ("www", names[0]);
+  ares_strsplit_free(names, names_len);
+}
+
+/* A name ending in '.' is never searched, no matter how hostile the
+ * configuration is: the candidate list is exactly the name itself. */
+TEST_F(LibraryTest, SearchNameListAbsoluteName)
+{
+  std::string         suffix = SearchMaxSuffix();
+  std::vector<char *> domains(8, (char *)suffix.c_str());
+  char              **names     = NULL;
+  size_t              names_len = 0;
+  ares_status_t       status;
+
+  status = SearchNameList("www.example.com.", &domains[0], (int)domains.size(),
+                          1000000, &names, &names_len);
+  ASSERT_EQ(ARES_SUCCESS, status);
+  ASSERT_EQ(1, names_len);
+  EXPECT_STREQ("www.example.com.", names[0]);
+  ares_strsplit_free(names, names_len);
+}
+
+#  ifndef WIN32
+/* An HOSTALIASES entry whose target cannot fit in the alias parser's buffer
+ * is skipped, not returned: the lookup falls back to the (bounded) search
+ * list. */
+TEST_F(LibraryTest, SearchNameListOverlongHostAliasSkipped)
+{
+  char         *domains[3] = { (char *)"first.com", (char *)"second.org",
+                               (char *)"third.gov" };
+  char        **names      = NULL;
+  size_t        names_len  = 0;
+  ares_status_t status;
+  std::string   longalias(300, 'a');
+  TempFile      aliases("www " + longalias + "\n");
+  EnvValue      with_env("HOSTALIASES", aliases.filename());
+
+  status = SearchNameList("www", domains, 3, 1, &names, &names_len);
+  ASSERT_EQ(ARES_SUCCESS, status);
+  ASSERT_EQ(4, names_len);
+  EXPECT_STREQ("www.first.com", names[0]);
+  EXPECT_STREQ("www.second.org", names[1]);
+  EXPECT_STREQ("www.third.gov", names[2]);
+  EXPECT_STREQ("www", names[3]);
+  ares_strsplit_free(names, names_len);
+}
+
+/* A HOSTALIASES entry chosen for the name replaces the search list entirely,
+ * so a malicious alias file can produce at most one candidate. */
+TEST_F(LibraryTest, SearchNameListHostAliasSingleCandidate)
+{
+  char         *domains[3] = { (char *)"first.com", (char *)"second.org",
+                               (char *)"third.gov" };
+  char        **names      = NULL;
+  size_t        names_len  = 0;
+  ares_status_t status;
+  TempFile      aliases("www www.example.com\n");
+  EnvValue      with_env("HOSTALIASES", aliases.filename());
+
+  status = SearchNameList("www", domains, 3, 1, &names, &names_len);
+  ASSERT_EQ(ARES_SUCCESS, status);
+  ASSERT_EQ(1, names_len);
+  EXPECT_STREQ("www.example.com", names[0]);
+  ares_strsplit_free(names, names_len);
+}
+#  endif /* !WIN32 */
+
 TEST_F(LibraryTest, SlistMisuse) {
   EXPECT_EQ(NULL, ares_slist_create(NULL, NULL, NULL));
   ares_slist_replace_destructor(NULL, NULL);
